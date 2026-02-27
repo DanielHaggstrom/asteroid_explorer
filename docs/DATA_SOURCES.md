@@ -23,3 +23,4 @@
 1. Browser requests same-origin endpoint `/api/main-belt`.
 2. Node server proxies and normalizes JPL data to avoid client CORS/network failures.
 3. If JPL is unavailable, a local fallback snapshot (`data/main-belt-fallback.json`) is served so the UI remains functional.
+4. Client-side direct calls to JPL are intentionally disabled.

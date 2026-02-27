@@ -65,16 +65,10 @@ npm run dev
 Then open:
 - `http://localhost:4173`
 
-If you explicitly want static-only mode:
-```bash
-npm run serve:static
-```
-In static-only mode, the app can still use fallback data if direct upstream calls fail.
-
 ## Production/Publishing
 Recommended deployment is Node hosting (Render, Railway, Fly.io, etc.) so the same-origin proxy avoids browser CORS/network issues against third-party APIs.
 
-Static hosting is possible, but live upstream access is not guaranteed from browsers; fallback snapshot will be used when direct API access fails.
+Static-only hosting is not supported for live data in this version because the client is intentionally proxy-only.
 
 Recommended production settings:
 1. HTTPS enforced.
