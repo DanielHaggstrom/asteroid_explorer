@@ -1,0 +1,16 @@
+{
+  "name": "asteroid-explorer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Browser dashboard for exploring asteroid-belt objects using official JPL SBDB API data.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "node server.mjs",
+    "serve": "node server.mjs",
+    "serve:static": "python -m http.server 4173",
+    "test": "node tests/utils.test.mjs"
+  }
+}

@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Asteroid Belt Explorer</title>
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; connect-src 'self' https://ssd-api.jpl.nasa.gov; img-src 'self' data:; style-src 'self'; script-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; upgrade-insecure-requests"
+    >
+    <meta
+      name="description"
+      content="Interactive browser dashboard for exploring main-belt asteroid populations and individual orbital properties."
+    >
+    <link rel="stylesheet" href="src/css/styles.css">
+  </head>
+  <body>
+    <div class="bg-layer" aria-hidden="true"></div>
+    <main class="page-shell">
+      <header class="hero panel reveal delay-1">
+        <div>
+          <p class="eyebrow">NASA/JPL Public Data</p>
+          <h1>Asteroid Belt Explorer</h1>
+          <p class="subtitle">
+            Explore asteroid population patterns, orbital structure, and individual objects with an
+            intuitive browser dashboard.
+          </p>
+        </div>
+        <div class="hero-meta">
+          <p id="sourceBadge">Source: loading...</p>
+          <p id="statusMessage" role="status" aria-live="polite">Loading asteroid data...</p>
+        </div>
+      </header>
+
+      <section class="panel controls reveal delay-2" aria-label="Filters">
+        <label for="searchInput">Search Object</label>
+        <input id="searchInput" type="search" placeholder="Name or SPK-ID" autocomplete="off">
+
+        <label for="zoneSelect">Belt Zone</label>
+        <select id="zoneSelect">
+          <option value="all">All zones</option>
+          <option value="Inner Belt">Inner belt</option>
+          <option value="Middle Belt">Middle belt</option>
+          <option value="Outer Belt">Outer belt</option>
+        </select>
+
+        <label for="mapDensityRange">Map Density</label>
+        <div class="range-wrap">
+          <input id="mapDensityRange" type="range" min="150" max="1500" step="50" value="600">
+          <output id="mapDensityValue" for="mapDensityRange">600</output>
+        </div>
+      </section>
+
+      <section class="kpi-grid reveal delay-3" aria-label="Key metrics">
+        <article class="panel kpi-card">
+          <h2>Total Objects</h2>
+          <p id="kpiTotal">-</p>
+        </article>
+        <article class="panel kpi-card">
+          <h2>Diameter Coverage</h2>
+          <p id="kpiDiameterCoverage">-</p>
+        </article>
+        <article class="panel kpi-card">
+          <h2>Mean Diameter</h2>
+          <p id="kpiMeanDiameter">-</p>
+        </article>
+        <article class="panel kpi-card">
+          <h2>Mean Eccentricity</h2>
+          <p id="kpiMeanEccentricity">-</p>
+        </article>
+        <article class="panel kpi-card">
+          <h2>Dominant Zone</h2>
+          <p id="kpiDominantZone">-</p>
+        </article>
+      </section>
+
+      <section class="chart-grid">
+        <article class="panel chart-card reveal delay-4">
+          <h2>Population by Size Category</h2>
+          <canvas id="sizeChart" aria-label="Bar chart of size categories"></canvas>
+        </article>
+        <article class="panel chart-card reveal delay-4">
+          <h2>Orbital Spread: Semi-major Axis vs Eccentricity</h2>
+          <canvas id="orbitScatterChart" aria-label="Scatter plot of orbital parameters"></canvas>
+        </article>
+      </section>
+
+      <section class="explorer-grid">
+        <article class="panel map-card reveal delay-5">
+          <h2>Belt Navigator</h2>
+          <canvas id="beltMap" aria-label="Top-down asteroid belt map"></canvas>
+          <p class="hint">Click a point to inspect an asteroid.</p>
+        </article>
+
+        <article class="panel details-card reveal delay-6">
+          <h2>Selected Object</h2>
+          <dl class="details-grid">
+            <dt>Name</dt>
+            <dd id="detailName">-</dd>
+            <dt>SPK-ID</dt>
+            <dd id="detailId">-</dd>
+            <dt>Class</dt>
+            <dd id="detailClass">-</dd>
+            <dt>Belt Zone</dt>
+            <dd id="detailZone">-</dd>
+            <dt>Semi-major axis</dt>
+            <dd id="detailA">-</dd>
+            <dt>Eccentricity</dt>
+            <dd id="detailE">-</dd>
+            <dt>Inclination</dt>
+            <dd id="detailI">-</dd>
+            <dt>Diameter</dt>
+            <dd id="detailDiameter">-</dd>
+            <dt>Albedo</dt>
+            <dd id="detailAlbedo">-</dd>
+            <dt>Absolute mag (H)</dt>
+            <dd id="detailH">-</dd>
+            <dt>Orbital period</dt>
+            <dd id="detailPeriod">-</dd>
+            <dt>Epoch (MJD)</dt>
+            <dd id="detailEpoch">-</dd>
+          </dl>
+        </article>
+      </section>
+
+      <section class="panel table-card reveal delay-7">
+        <h2>Objects</h2>
+        <p id="tableSummary">Showing 0 objects.</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Zone</th>
+                <th>a (AU)</th>
+                <th>e</th>
+                <th>i (deg)</th>
+                <th>Diameter (km)</th>
+              </tr>
+            </thead>
+            <tbody id="asteroidTableBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="src/js/app.js"></script>
+  </body>
+</html>
