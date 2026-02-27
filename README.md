@@ -4,8 +4,10 @@ Browser-based dashboard for visual and intuitive exploration of main-belt astero
 
 ## What This Builds
 1. Population-level understanding:
-- Size category counts.
+- Fine-grained size category counts.
 - Orbital distribution (`a` vs `e`) with inclination color cue.
+- Semi-major-axis density profile with resonance markers (Kirkwood-gap context).
+- True-anomaly angular distribution histogram.
 - Key summary metrics.
 
 2. Spatial intuition:
@@ -19,9 +21,11 @@ Browser-based dashboard for visual and intuitive exploration of main-belt astero
 The project starts with visualizations that provide high explanatory value for the belt while staying robust in-browser:
 1. Size distribution bar chart.
 2. Orbital scatter chart.
-3. Belt map navigator.
-4. KPI cards.
-5. Searchable object list + details pane.
+3. Semi-major-axis density histogram with resonance guides.
+4. True-anomaly distribution histogram.
+5. Belt map navigator.
+6. KPI cards.
+7. Searchable object list + details pane.
 
 See:
 - [Roadmap](docs/ROADMAP.md)
@@ -33,8 +37,11 @@ Primary source:
 
 Runtime access model:
 1. Browser calls same-origin `/api/main-belt` (Node proxy).
-2. Proxy fetches JPL API and caches short-term in memory.
-3. If upstream is unavailable, app serves local fallback snapshot (`data/main-belt-fallback.json`).
+2. Proxy fetches a random-window sample from JPL API and caches short-term in memory.
+3. Search input triggers live `/api/search` calls that resolve and pull matching objects from the full catalog.
+4. If upstream is unavailable, app serves local fallback snapshot (`data/main-belt-fallback.json`).
+
+By default, the proxy loads a random sample window of 50,000 main-belt objects per refresh for interactive performance (the API itself has far more).
 
 Reference docs:
 - https://ssd-api.jpl.nasa.gov/doc/sbdb_query.html

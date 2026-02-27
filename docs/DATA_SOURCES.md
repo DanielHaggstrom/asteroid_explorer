@@ -22,5 +22,7 @@
 ## Delivery Strategy
 1. Browser requests same-origin endpoint `/api/main-belt`.
 2. Node server proxies and normalizes JPL data to avoid client CORS/network failures.
-3. If JPL is unavailable, a local fallback snapshot (`data/main-belt-fallback.json`) is served so the UI remains functional.
-4. Client-side direct calls to JPL are intentionally disabled.
+3. `/api/main-belt` returns a random sample window of the main-belt catalog (high-volume but bounded for interactivity).
+4. `/api/search?q=...` resolves user text against live SBDB object search and fetches matching objects into the dashboard.
+5. If JPL is unavailable, a local fallback snapshot (`data/main-belt-fallback.json`) is served so the UI remains functional.
+6. Client-side direct calls to JPL are intentionally disabled.
