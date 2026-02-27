@@ -1,8 +1,12 @@
 export const DIAMETER_BUCKETS = Object.freeze([
-  "<1 km",
-  "1-5 km",
-  "5-20 km",
-  ">=20 km",
+  "<0.5 km",
+  "0.5-1 km",
+  "1-2 km",
+  "2-5 km",
+  "5-10 km",
+  "10-20 km",
+  "20-50 km",
+  ">=50 km",
   "Unknown"
 ]);
 
@@ -65,16 +69,28 @@ export function categorizeDiameterKm(diameterKm) {
   if (!Number.isFinite(diameterKm)) {
     return "Unknown";
   }
+  if (diameterKm < 0.5) {
+    return "<0.5 km";
+  }
   if (diameterKm < 1) {
-    return "<1 km";
+    return "0.5-1 km";
+  }
+  if (diameterKm < 2) {
+    return "1-2 km";
   }
   if (diameterKm < 5) {
-    return "1-5 km";
+    return "2-5 km";
+  }
+  if (diameterKm < 10) {
+    return "5-10 km";
   }
   if (diameterKm < 20) {
-    return "5-20 km";
+    return "10-20 km";
   }
-  return ">=20 km";
+  if (diameterKm < 50) {
+    return "20-50 km";
+  }
+  return ">=50 km";
 }
 
 export function computeSizeBuckets(asteroids) {
@@ -169,6 +185,25 @@ export function orbitalPositionFromElements(elements) {
   };
 }
 
+export function trueAnomalyDegreesFromElements(elements) {
+  const { e, ma } = elements;
+  if (!Number.isFinite(e) || !Number.isFinite(ma)) {
+    return null;
+  }
+
+  const meanAnomaly = degreesToRadians(normalizeAngleDegrees(ma));
+  const eccentricAnomaly = solveKeplerEquation(meanAnomaly, e);
+  if (!Number.isFinite(eccentricAnomaly)) {
+    return null;
+  }
+
+  const trueAnomaly = 2 * Math.atan2(
+    Math.sqrt(1 + e) * Math.sin(eccentricAnomaly / 2),
+    Math.sqrt(1 - e) * Math.cos(eccentricAnomaly / 2)
+  );
+  return normalizeAngleDegrees(radiansToDegrees(trueAnomaly));
+}
+
 export function findNearestPoint(points, x, y, maxDistance) {
   let nearest = null;
   let nearestDistance = Number.POSITIVE_INFINITY;
@@ -193,4 +228,8 @@ function normalizeAngleDegrees(degrees) {
 
 function degreesToRadians(degrees) {
   return (degrees * Math.PI) / 180;
+}
+
+function radiansToDegrees(radians) {
+  return (radians * 180) / Math.PI;
 }

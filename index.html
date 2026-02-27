@@ -43,12 +43,6 @@
           <option value="Middle Belt">Middle belt</option>
           <option value="Outer Belt">Outer belt</option>
         </select>
-
-        <label for="mapDensityRange">Map Density</label>
-        <div class="range-wrap">
-          <input id="mapDensityRange" type="range" min="150" max="1500" step="50" value="600">
-          <output id="mapDensityValue" for="mapDensityRange">600</output>
-        </div>
       </section>
 
       <section class="kpi-grid reveal delay-3" aria-label="Key metrics">
@@ -83,16 +77,31 @@
           <h2>Orbital Spread: Semi-major Axis vs Eccentricity</h2>
           <canvas id="orbitScatterChart" aria-label="Scatter plot of orbital parameters"></canvas>
         </article>
+        <article class="panel chart-card reveal delay-5">
+          <h2>Semi-major Axis Density (Kirkwood Gaps)</h2>
+          <canvas id="semiMajorAxisChart" aria-label="Histogram of semi-major axis"></canvas>
+        </article>
+        <article class="panel chart-card reveal delay-5">
+          <h2>Angular Distribution: True Anomaly</h2>
+          <canvas id="trueAnomalyChart" aria-label="Histogram of true anomaly angles"></canvas>
+        </article>
       </section>
 
       <section class="explorer-grid">
-        <article class="panel map-card reveal delay-5">
-          <h2>Belt Navigator</h2>
+        <article class="panel map-card reveal delay-6">
+          <div class="map-header">
+            <h2>Belt Navigator</h2>
+            <label for="mapDensityRange">Map Density</label>
+            <div class="range-wrap range-inline">
+              <input id="mapDensityRange" type="range" min="200" max="4000" step="100" value="1200">
+              <output id="mapDensityValue" for="mapDensityRange">1200</output>
+            </div>
+          </div>
           <canvas id="beltMap" aria-label="Top-down asteroid belt map"></canvas>
           <p class="hint">Click a point to inspect an asteroid.</p>
         </article>
 
-        <article class="panel details-card reveal delay-6">
+        <article class="panel details-card reveal delay-7">
           <h2>Selected Object</h2>
           <dl class="details-grid">
             <dt>Name</dt>

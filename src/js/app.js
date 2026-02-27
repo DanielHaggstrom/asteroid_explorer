@@ -1,6 +1,12 @@
 import { APP_CONFIG } from "./config.js";
 import { loadMainBeltAsteroids } from "./dataService.js";
-import { drawBarChart, drawBeltMap, drawScatterPlot } from "./charts.js";
+import {
+  drawBarChart,
+  drawBeltMap,
+  drawScatterPlot,
+  drawSemiMajorAxisHistogram,
+  drawTrueAnomalyHistogram
+} from "./charts.js";
 import {
   average,
   computeSizeBuckets,
@@ -24,6 +30,8 @@ const elements = {
   kpiDominantZone: document.getElementById("kpiDominantZone"),
   sizeChart: document.getElementById("sizeChart"),
   orbitScatterChart: document.getElementById("orbitScatterChart"),
+  semiMajorAxisChart: document.getElementById("semiMajorAxisChart"),
+  trueAnomalyChart: document.getElementById("trueAnomalyChart"),
   beltMap: document.getElementById("beltMap"),
   asteroidTableBody: document.getElementById("asteroidTableBody"),
   tableSummary: document.getElementById("tableSummary"),
@@ -41,17 +49,25 @@ const elements = {
   detailEpoch: document.getElementById("detailEpoch")
 };
 
+const REMOTE_SEARCH_MIN_QUERY_LENGTH = 2;
+const REMOTE_SEARCH_LIMIT = 25;
+
 const state = {
   allAsteroids: [],
   filteredAsteroids: [],
   selectedId: null,
   mapPoints: [],
+  searchRequestToken: 0,
   filters: {
     query: "",
     zone: "all",
     mapDensity: APP_CONFIG.maxMapPointsDefault
   }
 };
+
+const triggerRemoteSearch = debounce((query, token) => {
+  void fetchRemoteSearch(query, token);
+}, 420);
 
 attachListeners();
 bootstrap();
@@ -66,7 +82,7 @@ async function bootstrap() {
 
     state.allAsteroids = result.asteroids;
     state.selectedId = result.asteroids[0]?.id ?? null;
-    elements.sourceBadge.textContent = `Source: ${result.meta.source} (${formatNumber(result.meta.loadedCount, 0)} loaded)`;
+    elements.sourceBadge.textContent = buildSourceBadgeText(result.meta);
     if (result.meta.warning) {
       setStatus(result.meta.warning, "warning");
     } else {
@@ -86,7 +102,11 @@ async function bootstrap() {
 function attachListeners() {
   elements.searchInput.addEventListener("input", (event) => {
     state.filters.query = event.target.value.trim().toLowerCase();
+    const requestToken = ++state.searchRequestToken;
     applyFiltersAndRender();
+    if (state.filters.query.length >= REMOTE_SEARCH_MIN_QUERY_LENGTH) {
+      triggerRemoteSearch(state.filters.query, requestToken);
+    }
   });
 
   elements.zoneSelect.addEventListener("change", (event) => {
@@ -166,6 +186,8 @@ function renderKpis() {
 function renderVisualizations() {
   drawBarChart(elements.sizeChart, computeSizeBuckets(state.filteredAsteroids));
   drawScatterPlot(elements.orbitScatterChart, state.filteredAsteroids);
+  drawSemiMajorAxisHistogram(elements.semiMajorAxisChart, state.filteredAsteroids);
+  drawTrueAnomalyHistogram(elements.trueAnomalyChart, state.filteredAsteroids);
   state.mapPoints = drawBeltMap(
     elements.beltMap,
     state.filteredAsteroids,
@@ -260,6 +282,51 @@ function setStatus(message, type = "info") {
   elements.statusMessage.classList.toggle("is-warning", normalizedType === "warning");
 }
 
+async function fetchRemoteSearch(query, requestToken) {
+  if (requestToken !== state.searchRequestToken || query !== state.filters.query) {
+    return;
+  }
+
+  try {
+    const params = new URLSearchParams({
+      q: query,
+      limit: String(REMOTE_SEARCH_LIMIT)
+    });
+    const response = await fetch(`/api/search?${params.toString()}`, {
+      headers: { Accept: "application/json" }
+    });
+    if (!response.ok) {
+      throw new Error(`search status ${response.status}`);
+    }
+
+    const payload = await response.json();
+    if (requestToken !== state.searchRequestToken || query !== state.filters.query) {
+      return;
+    }
+
+    const remoteAsteroids = Array.isArray(payload.asteroids) ? payload.asteroids : [];
+    if (remoteAsteroids.length > 0) {
+      state.allAsteroids = mergeAsteroids(state.allAsteroids, remoteAsteroids);
+      applyFiltersAndRender();
+    }
+  } catch (error) {
+    if (requestToken !== state.searchRequestToken || query !== state.filters.query) {
+      return;
+    }
+    setStatus(`Search endpoint warning: ${error.message}`, "warning");
+  }
+}
+
+function mergeAsteroids(baseAsteroids, incomingAsteroids) {
+  const mergedById = new Map(baseAsteroids.map((item) => [item.id, item]));
+  for (const asteroid of incomingAsteroids) {
+    if (asteroid && asteroid.id) {
+      mergedById.set(asteroid.id, asteroid);
+    }
+  }
+  return Array.from(mergedById.values());
+}
+
 function debounce(fn, delayMs) {
   let timeoutHandle = null;
   return (...args) => {
@@ -268,4 +335,13 @@ function debounce(fn, delayMs) {
     }
     timeoutHandle = setTimeout(() => fn(...args), delayMs);
   };
+}
+
+function buildSourceBadgeText(meta) {
+  const loaded = formatNumber(meta.loadedCount, 0);
+  if (Number.isFinite(meta.availableCount) && meta.availableCount > 0) {
+    const available = formatNumber(meta.availableCount, 0);
+    return `Source: ${meta.source} (${loaded} / ${available} loaded)`;
+  }
+  return `Source: ${meta.source} (${loaded} loaded)`;
 }
