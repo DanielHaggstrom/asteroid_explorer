@@ -10,7 +10,7 @@
   - pagination with `limit` and `limit-from`
 
 ## Retrieved Fields
-1. Identity: `spkid`, `full_name`, `class`
+1. Identity: `spkid`, `full_name`, `pdes`, `class`
 2. Orbital: `a`, `e`, `i`, `om`, `w`, `ma`, `epoch`
 3. Physical: `diameter`, `albedo`, `H`
 
@@ -22,7 +22,8 @@
 ## Delivery Strategy
 1. Browser requests same-origin endpoint `/api/main-belt`.
 2. Node server proxies and normalizes JPL data to avoid client CORS/network failures.
-3. `/api/main-belt` returns a random sample window of the main-belt catalog (high-volume but bounded for interactivity).
-4. `/api/search?q=...` resolves user text against live SBDB object search and fetches matching objects into the dashboard.
-5. If JPL is unavailable, a local fallback snapshot (`data/main-belt-fallback.json`) is served so the UI remains functional.
-6. Client-side direct calls to JPL are intentionally disabled.
+3. If local snapshot files are available (`data/catalog/manifest.json`), `/api/main-belt` samples from local chunks first.
+4. `/api/search?q=...` searches local index first; only if local misses does it query live SBDB APIs.
+5. Background refresh periodically pulls live API windows and overlays fresher records in-memory.
+6. If JPL is unavailable and no local snapshot is available, fallback snapshot (`data/main-belt-fallback.json`) keeps UI functional.
+7. Client-side direct calls to JPL are intentionally disabled.

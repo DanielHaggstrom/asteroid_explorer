@@ -8,6 +8,7 @@ The asteroid belt is best understood through both population-level summaries and
 - Goal: show how many objects are tiny versus large.
 - Data: `diameter`.
 - Categories: `<0.5`, `0.5-1`, `1-2`, `2-5`, `5-10`, `10-20`, `20-50`, `>=50 km`, `Unknown`.
+- Visualization note: `Unknown` is excluded from the plotted bars to avoid distorting diameter-shape interpretation.
 
 2. Orbital Distribution (Scatter Plot)
 - Goal: reveal clustering and spread of orbital shapes.
@@ -35,7 +36,7 @@ The asteroid belt is best understood through both population-level summaries and
 
 7. Searchable Object Table + Details Panel
 - Goal: bridge charts to object-level interpretation.
-- Table provides scannable rows; selection opens concise summary of orbital and physical values.
+- Table supports sorting, local table filters, and pagination; selection opens concise summary of orbital and physical values.
 
 ## Interaction Model
 1. Filter first (text + belt zone).

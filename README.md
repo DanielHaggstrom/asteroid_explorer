@@ -14,7 +14,7 @@ Browser-based dashboard for visual and intuitive exploration of main-belt astero
 - Top-down belt navigator using orbital elements for approximate object placement.
 
 3. Object-level inspection:
-- Search/filter + clickable table/map.
+- Search/filter + sortable/paginated table + clickable map.
 - Detail panel for selected asteroid.
 
 ## Chosen Visualization Objectives
@@ -37,9 +37,10 @@ Primary source:
 
 Runtime access model:
 1. Browser calls same-origin `/api/main-belt` (Node proxy).
-2. Proxy fetches a random-window sample from JPL API and caches short-term in memory.
-3. Search input triggers live `/api/search` calls that resolve and pull matching objects from the full catalog.
-4. If upstream is unavailable, app serves local fallback snapshot (`data/main-belt-fallback.json`).
+2. If local catalog files exist, proxy serves random sampled chunks from local storage.
+3. Search uses local catalog index first; if no local match is found, it falls back to JPL API search.
+4. Background API refresh updates an in-memory overlay for fresher objects.
+5. If upstream is unavailable, app serves local fallback snapshot (`data/main-belt-fallback.json`).
 
 By default, the proxy loads a random sample window of 50,000 main-belt objects per refresh for interactive performance (the API itself has far more).
 
@@ -71,6 +72,16 @@ npm run dev
 
 Then open:
 - `http://localhost:4173`
+
+### Build Local Full Catalog Snapshot
+```bash
+npm run catalog:build
+```
+
+This downloads the full MBA catalog into chunked files under `data/catalog/`, writes a local search index, and precomputes aggregate stats used by the server.
+
+When a catalog snapshot is present, optional precomputed stats are available at:
+- `GET /api/stats`
 
 ## Production/Publishing
 Recommended deployment is Node hosting (Render, Railway, Fly.io, etc.) so the same-origin proxy avoids browser CORS/network issues against third-party APIs.
