@@ -43,6 +43,16 @@ assert.equal(buckets["20-50 km"], 1);
 assert.equal(buckets[">=50 km"], 1);
 assert.equal(buckets.Unknown, 1);
 
+const noUnknownBuckets = computeSizeBuckets(
+  [
+    { diameterKm: 0.4 },
+    { diameterKm: null }
+  ],
+  { includeUnknown: false }
+);
+assert.equal(noUnknownBuckets["<0.5 km"], 1);
+assert.equal(Object.hasOwn(noUnknownBuckets, "Unknown"), false);
+
 const meanAnomaly = Math.PI / 3;
 assert.equal(solveKeplerEquation(meanAnomaly, 0), meanAnomaly);
 

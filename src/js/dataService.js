@@ -95,6 +95,7 @@ function normalizeStandardizedAsteroid(item) {
   return {
     id: String(id),
     name: String(name),
+    primaryDesignation: item.primaryDesignation ? String(item.primaryDesignation) : null,
     classCode: String(item.classCode ?? "Unknown"),
     zone: item.zone ?? classifyBeltZone(a),
     a,

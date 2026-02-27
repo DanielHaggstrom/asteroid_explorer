@@ -35,6 +35,13 @@ const elements = {
   beltMap: document.getElementById("beltMap"),
   asteroidTableBody: document.getElementById("asteroidTableBody"),
   tableSummary: document.getElementById("tableSummary"),
+  tableDiameterFilter: document.getElementById("tableDiameterFilter"),
+  tableMinDiameter: document.getElementById("tableMinDiameter"),
+  tablePageSize: document.getElementById("tablePageSize"),
+  tablePrevPage: document.getElementById("tablePrevPage"),
+  tableNextPage: document.getElementById("tableNextPage"),
+  tablePageIndicator: document.getElementById("tablePageIndicator"),
+  tableSortButtons: Array.from(document.querySelectorAll(".sort-btn")),
   detailName: document.getElementById("detailName"),
   detailId: document.getElementById("detailId"),
   detailClass: document.getElementById("detailClass"),
@@ -54,6 +61,7 @@ const REMOTE_SEARCH_LIMIT = 25;
 
 const state = {
   allAsteroids: [],
+  zoneFilteredAsteroids: [],
   filteredAsteroids: [],
   selectedId: null,
   mapPoints: [],
@@ -62,6 +70,14 @@ const state = {
     query: "",
     zone: "all",
     mapDensity: APP_CONFIG.maxMapPointsDefault
+  },
+  table: {
+    diameterFilter: "all",
+    minDiameterKm: null,
+    pageSize: APP_CONFIG.tablePageSizeDefault,
+    page: 1,
+    sortKey: "name",
+    sortDirection: "asc"
   }
 };
 
@@ -93,6 +109,7 @@ async function bootstrap() {
     elements.sourceBadge.textContent = "Source: unavailable";
     setStatus(`Failed to load data: ${error.message}`, true);
     state.allAsteroids = [];
+    state.zoneFilteredAsteroids = [];
     state.filteredAsteroids = [];
     state.selectedId = null;
     renderAll();
@@ -103,6 +120,7 @@ function attachListeners() {
   elements.searchInput.addEventListener("input", (event) => {
     state.filters.query = event.target.value.trim().toLowerCase();
     const requestToken = ++state.searchRequestToken;
+    state.table.page = 1;
     applyFiltersAndRender();
     if (state.filters.query.length >= REMOTE_SEARCH_MIN_QUERY_LENGTH) {
       triggerRemoteSearch(state.filters.query, requestToken);
@@ -111,6 +129,7 @@ function attachListeners() {
 
   elements.zoneSelect.addEventListener("change", (event) => {
     state.filters.zone = event.target.value;
+    state.table.page = 1;
     applyFiltersAndRender();
   });
 
@@ -119,6 +138,64 @@ function attachListeners() {
     state.filters.mapDensity = Number.isFinite(density) ? density : APP_CONFIG.maxMapPointsDefault;
     elements.mapDensityValue.textContent = String(state.filters.mapDensity);
     renderVisualizations();
+  });
+
+  elements.tableDiameterFilter.addEventListener("change", (event) => {
+    state.table.diameterFilter = event.target.value;
+    state.table.page = 1;
+    renderTable();
+  });
+
+  elements.tableMinDiameter.addEventListener("input", (event) => {
+    const raw = event.target.value.trim();
+    if (!raw) {
+      state.table.minDiameterKm = null;
+    } else {
+      const value = Number(raw);
+      state.table.minDiameterKm = Number.isFinite(value) && value >= 0 ? value : null;
+    }
+    state.table.page = 1;
+    renderTable();
+  });
+
+  elements.tablePageSize.addEventListener("change", (event) => {
+    const value = Number(event.target.value);
+    state.table.pageSize = Number.isFinite(value) && value > 0 ? value : APP_CONFIG.tablePageSizeDefault;
+    state.table.page = 1;
+    renderTable();
+  });
+
+  elements.tablePrevPage.addEventListener("click", () => {
+    if (state.table.page > 1) {
+      state.table.page -= 1;
+      renderTable();
+    }
+  });
+
+  elements.tableNextPage.addEventListener("click", () => {
+    const totalPages = getTableTotalPages();
+    if (state.table.page < totalPages) {
+      state.table.page += 1;
+      renderTable();
+    }
+  });
+
+  elements.tableSortButtons.forEach((button) => {
+    button.addEventListener("click", () => {
+      const sortKey = button.dataset.sortKey;
+      if (!sortKey) {
+        return;
+      }
+
+      if (state.table.sortKey === sortKey) {
+        state.table.sortDirection = state.table.sortDirection === "asc" ? "desc" : "asc";
+      } else {
+        state.table.sortKey = sortKey;
+        state.table.sortDirection = "asc";
+      }
+      state.table.page = 1;
+      renderTable();
+    });
   });
 
   elements.beltMap.addEventListener("click", (event) => {
@@ -140,23 +217,29 @@ function attachListeners() {
 }
 
 function applyFiltersAndRender() {
-  state.filteredAsteroids = state.allAsteroids.filter((asteroid) => {
-    const zoneMatches = state.filters.zone === "all" || asteroid.zone === state.filters.zone;
-    if (!zoneMatches) {
-      return false;
+  state.zoneFilteredAsteroids = state.allAsteroids.filter(
+    (asteroid) => state.filters.zone === "all" || asteroid.zone === state.filters.zone
+  );
+
+  if (state.filters.query) {
+    state.filteredAsteroids = state.allAsteroids.filter((asteroid) =>
+      matchesSearchQuery(asteroid, state.filters.query)
+    );
+  } else {
+    state.filteredAsteroids = state.zoneFilteredAsteroids;
+  }
+
+  if (state.filters.query) {
+    if (state.filteredAsteroids.length > 0) {
+      const selectedStillVisible = state.filteredAsteroids.some((item) => item.id === state.selectedId);
+      if (!selectedStillVisible) {
+        state.selectedId = state.filteredAsteroids[0]?.id ?? null;
+      }
+    } else if (!state.zoneFilteredAsteroids.some((item) => item.id === state.selectedId)) {
+      state.selectedId = state.zoneFilteredAsteroids[0]?.id ?? null;
     }
-
-    if (!state.filters.query) {
-      return true;
-    }
-
-    const target = `${asteroid.name} ${asteroid.id}`.toLowerCase();
-    return target.includes(state.filters.query);
-  });
-
-  const selectedStillVisible = state.filteredAsteroids.some((item) => item.id === state.selectedId);
-  if (!selectedStillVisible) {
-    state.selectedId = state.filteredAsteroids[0]?.id ?? null;
+  } else if (!state.zoneFilteredAsteroids.some((item) => item.id === state.selectedId)) {
+    state.selectedId = state.zoneFilteredAsteroids[0]?.id ?? null;
   }
 
   renderAll();
@@ -170,7 +253,7 @@ function renderAll() {
 }
 
 function renderKpis() {
-  const records = state.filteredAsteroids;
+  const records = state.zoneFilteredAsteroids;
   const total = records.length;
   const withDiameter = records.filter((item) => Number.isFinite(item.diameterKm));
   const meanDiameter = average(withDiameter.map((item) => item.diameterKm));
@@ -184,26 +267,45 @@ function renderKpis() {
 }
 
 function renderVisualizations() {
-  drawBarChart(elements.sizeChart, computeSizeBuckets(state.filteredAsteroids));
-  drawScatterPlot(elements.orbitScatterChart, state.filteredAsteroids);
-  drawSemiMajorAxisHistogram(elements.semiMajorAxisChart, state.filteredAsteroids);
-  drawTrueAnomalyHistogram(elements.trueAnomalyChart, state.filteredAsteroids);
+  drawBarChart(elements.sizeChart, computeSizeBuckets(state.zoneFilteredAsteroids, { includeUnknown: false }));
+  drawScatterPlot(elements.orbitScatterChart, state.zoneFilteredAsteroids);
+  drawSemiMajorAxisHistogram(elements.semiMajorAxisChart, state.zoneFilteredAsteroids);
+  drawTrueAnomalyHistogram(elements.trueAnomalyChart, state.zoneFilteredAsteroids);
   state.mapPoints = drawBeltMap(
     elements.beltMap,
-    state.filteredAsteroids,
+    state.zoneFilteredAsteroids,
     state.selectedId,
     state.filters.mapDensity
   );
 }
 
 function renderTable() {
-  const rows = state.filteredAsteroids.slice(0, APP_CONFIG.maxTableRows);
-  const rowElements = rows.map((asteroid) => createRow(asteroid));
+  const sortedRows = getTableRows();
+  const pageSize = state.table.pageSize;
+  const totalPages = Math.max(1, Math.ceil(sortedRows.length / pageSize));
+  if (state.table.page > totalPages) {
+    state.table.page = totalPages;
+  }
+  const pageStartIndex = (state.table.page - 1) * pageSize;
+  const pageRows = sortedRows.slice(pageStartIndex, pageStartIndex + pageSize);
+
+  const rowElements = pageRows.map((asteroid) => createRow(asteroid));
   elements.asteroidTableBody.replaceChildren(...rowElements);
 
+  const pageEndIndex = pageStartIndex + pageRows.length;
+  const rangeLabel = sortedRows.length
+    ? `${formatNumber(pageStartIndex + 1, 0)}-${formatNumber(pageEndIndex, 0)}`
+    : "0-0";
   elements.tableSummary.textContent =
-    `Showing ${formatNumber(rows.length, 0)} of ${formatNumber(state.filteredAsteroids.length, 0)} filtered ` +
-    `objects (${formatNumber(state.allAsteroids.length, 0)} loaded total).`;
+    `Rows ${rangeLabel} of ${formatNumber(sortedRows.length, 0)} table matches ` +
+    `(${formatNumber(state.zoneFilteredAsteroids.length, 0)} zone-filtered, ` +
+    `${formatNumber(state.filteredAsteroids.length, 0)} search-matched, ` +
+    `${formatNumber(state.allAsteroids.length, 0)} loaded).`;
+
+  elements.tablePageIndicator.textContent = `Page ${formatNumber(state.table.page, 0)} / ${formatNumber(totalPages, 0)}`;
+  elements.tablePrevPage.disabled = state.table.page <= 1;
+  elements.tableNextPage.disabled = state.table.page >= totalPages;
+  updateSortButtonState();
 }
 
 function createRow(asteroid) {
@@ -231,6 +333,56 @@ function appendCell(row, text) {
   const cell = document.createElement("td");
   cell.textContent = text;
   row.appendChild(cell);
+}
+
+function getTableRows() {
+  const baseRows = state.filters.query ? state.filteredAsteroids : state.zoneFilteredAsteroids;
+  const filtered = baseRows.filter((asteroid) => {
+    if (state.table.diameterFilter === "known" && !Number.isFinite(asteroid.diameterKm)) {
+      return false;
+    }
+    if (state.table.diameterFilter === "unknown" && Number.isFinite(asteroid.diameterKm)) {
+      return false;
+    }
+    if (Number.isFinite(state.table.minDiameterKm) && (!Number.isFinite(asteroid.diameterKm) || asteroid.diameterKm < state.table.minDiameterKm)) {
+      return false;
+    }
+    return true;
+  });
+
+  const direction = state.table.sortDirection === "desc" ? -1 : 1;
+  const sortKey = state.table.sortKey;
+  return filtered.slice().sort((left, right) => compareBySortKey(left, right, sortKey) * direction);
+}
+
+function compareBySortKey(left, right, sortKey) {
+  const leftValue = left[sortKey];
+  const rightValue = right[sortKey];
+
+  if (sortKey === "name" || sortKey === "zone") {
+    return String(leftValue ?? "").localeCompare(String(rightValue ?? ""));
+  }
+
+  const safeLeft = Number.isFinite(leftValue) ? leftValue : Number.NEGATIVE_INFINITY;
+  const safeRight = Number.isFinite(rightValue) ? rightValue : Number.NEGATIVE_INFINITY;
+  return safeLeft - safeRight;
+}
+
+function getTableTotalPages() {
+  const totalRows = getTableRows().length;
+  return Math.max(1, Math.ceil(totalRows / state.table.pageSize));
+}
+
+function updateSortButtonState() {
+  elements.tableSortButtons.forEach((button) => {
+    const isActive = button.dataset.sortKey === state.table.sortKey;
+    const baseLabel = button.dataset.baseLabel ?? button.textContent.trim();
+    button.dataset.baseLabel = baseLabel;
+    button.classList.toggle("active", isActive);
+    button.textContent = isActive
+      ? `${baseLabel} ${state.table.sortDirection === "asc" ? "^" : "v"}`
+      : baseLabel;
+  });
 }
 
 function renderDetails() {
@@ -327,6 +479,14 @@ function mergeAsteroids(baseAsteroids, incomingAsteroids) {
   return Array.from(mergedById.values());
 }
 
+function matchesSearchQuery(asteroid, query) {
+  const target = [asteroid.name, asteroid.id, asteroid.primaryDesignation]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return target.includes(query);
+}
+
 function debounce(fn, delayMs) {
   let timeoutHandle = null;
   return (...args) => {
@@ -345,3 +505,4 @@ function buildSourceBadgeText(meta) {
   }
   return `Source: ${meta.source} (${loaded} loaded)`;
 }
+

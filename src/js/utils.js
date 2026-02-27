@@ -93,11 +93,16 @@ export function categorizeDiameterKm(diameterKm) {
   return ">=50 km";
 }
 
-export function computeSizeBuckets(asteroids) {
-  const buckets = Object.fromEntries(DIAMETER_BUCKETS.map((label) => [label, 0]));
+export function computeSizeBuckets(asteroids, options = {}) {
+  const includeUnknown = options.includeUnknown ?? true;
+  const labels = includeUnknown ? DIAMETER_BUCKETS : DIAMETER_BUCKETS.filter((label) => label !== "Unknown");
+  const buckets = Object.fromEntries(labels.map((label) => [label, 0]));
 
   for (const asteroid of asteroids) {
     const bucket = categorizeDiameterKm(asteroid.diameterKm);
+    if (bucket === "Unknown" && !includeUnknown) {
+      continue;
+    }
     buckets[bucket] += 1;
   }
 

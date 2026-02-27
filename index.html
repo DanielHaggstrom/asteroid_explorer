@@ -33,9 +33,6 @@
       </header>
 
       <section class="panel controls reveal delay-2" aria-label="Filters">
-        <label for="searchInput">Search Object</label>
-        <input id="searchInput" type="search" placeholder="Name or SPK-ID" autocomplete="off">
-
         <label for="zoneSelect">Belt Zone</label>
         <select id="zoneSelect">
           <option value="all">All zones</option>
@@ -102,6 +99,10 @@
         </article>
 
         <article class="panel details-card reveal delay-7">
+          <div class="details-search">
+            <label for="searchInput">Search Object</label>
+            <input id="searchInput" type="search" placeholder="Name or SPK-ID" autocomplete="off">
+          </div>
           <h2>Selected Object</h2>
           <dl class="details-grid">
             <dt>Name</dt>
@@ -134,17 +135,40 @@
 
       <section class="panel table-card reveal delay-7">
         <h2>Objects</h2>
+        <div class="table-toolbar">
+          <label for="tableDiameterFilter">Diameter Data</label>
+          <select id="tableDiameterFilter">
+            <option value="all">All</option>
+            <option value="known">Known only</option>
+            <option value="unknown">Unknown only</option>
+          </select>
+
+          <label for="tableMinDiameter">Min Diameter (km)</label>
+          <input id="tableMinDiameter" type="number" min="0" step="0.1" placeholder="0">
+
+          <label for="tablePageSize">Rows / page</label>
+          <select id="tablePageSize">
+            <option value="25">25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+        </div>
         <p id="tableSummary">Showing 0 objects.</p>
+        <div class="pagination-controls">
+          <button id="tablePrevPage" type="button">Prev</button>
+          <span id="tablePageIndicator">Page 1 / 1</span>
+          <button id="tableNextPage" type="button">Next</button>
+        </div>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>Name</th>
-                <th>Zone</th>
-                <th>a (AU)</th>
-                <th>e</th>
-                <th>i (deg)</th>
-                <th>Diameter (km)</th>
+                <th><button class="sort-btn" data-sort-key="name" type="button">Name</button></th>
+                <th><button class="sort-btn" data-sort-key="zone" type="button">Zone</button></th>
+                <th><button class="sort-btn" data-sort-key="a" type="button">a (AU)</button></th>
+                <th><button class="sort-btn" data-sort-key="e" type="button">e</button></th>
+                <th><button class="sort-btn" data-sort-key="i" type="button">i (deg)</button></th>
+                <th><button class="sort-btn" data-sort-key="diameterKm" type="button">Diameter (km)</button></th>
               </tr>
             </thead>
             <tbody id="asteroidTableBody"></tbody>

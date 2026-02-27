@@ -113,8 +113,9 @@ h1 {
   padding: 16px;
   display: grid;
   gap: 10px 14px;
-  grid-template-columns: minmax(260px, 1.4fr) minmax(220px, 1fr);
+  grid-template-columns: auto minmax(220px, 320px);
   align-items: center;
+  justify-content: start;
 }
 
 .controls label {
@@ -125,7 +126,6 @@ h1 {
   font-weight: 700;
 }
 
-.controls input[type="search"],
 .controls select {
   width: 100%;
   border: 1px solid var(--line);
@@ -262,6 +262,35 @@ canvas {
   align-items: baseline;
 }
 
+.details-search {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.details-search label {
+  font-size: 0.79rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.details-search input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 11px;
+  font: inherit;
+  color: inherit;
+  background: #fffdf9;
+}
+
+.details-search input:focus {
+  outline: 2px solid rgba(12, 125, 120, 0.3);
+  border-color: var(--accent);
+}
+
 .details-grid dt {
   margin: 0;
   color: var(--muted);
@@ -278,6 +307,60 @@ canvas {
 
 #tableSummary {
   margin-top: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.table-toolbar {
+  display: grid;
+  grid-template-columns: auto minmax(120px, 1fr) auto minmax(120px, 1fr) auto minmax(90px, 120px);
+  gap: 8px 12px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.table-toolbar label {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.table-toolbar select,
+.table-toolbar input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font: inherit;
+  color: inherit;
+  background: #fffdf9;
+}
+
+.pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.pagination-controls button {
+  border: 1px solid var(--line);
+  background: #fff8ef;
+  color: var(--ink);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.pagination-controls button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+#tablePageIndicator {
   color: var(--muted);
   font-size: 0.9rem;
 }
@@ -304,6 +387,21 @@ thead th {
   font-size: 0.83rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+.sort-btn {
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+}
+
+.sort-btn.active {
+  color: #7a3f2a;
 }
 
 th,
@@ -391,6 +489,10 @@ tbody tr.selected {
   }
 
   .controls {
+    grid-template-columns: 1fr;
+  }
+
+  .table-toolbar {
     grid-template-columns: 1fr;
   }
 
