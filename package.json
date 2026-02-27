@@ -10,6 +10,7 @@
   "scripts": {
     "dev": "node server.mjs",
     "serve": "node server.mjs",
+    "catalog:build": "node scripts/build_catalog.mjs",
     "test": "node tests/utils.test.mjs"
   }
 }

@@ -1,6 +1,8 @@
+import fs from "node:fs";
+import fsPromises from "node:fs/promises";
 import http from "node:http";
-import fs from "node:fs/promises";
 import path from "node:path";
+import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -13,6 +15,7 @@ const OBJECT_API_BASE_URL = "https://ssd-api.jpl.nasa.gov/sbdb.api";
 const API_FIELDS = [
   "spkid",
   "full_name",
+  "pdes",
   "class",
   "a",
   "e",
@@ -25,15 +28,27 @@ const API_FIELDS = [
   "H",
   "epoch"
 ];
-const SAMPLE_OBJECTS = 50000;
+
+const CATALOG_DIR = path.join(ROOT_DIR, "data", "catalog");
+const CATALOG_MANIFEST_PATH = path.join(CATALOG_DIR, "manifest.json");
+
+const SAMPLE_OBJECTS = 50_000;
+const BACKGROUND_UPDATE_SAMPLE = 5_000;
+const BACKGROUND_UPDATE_INTERVAL_MS = 15 * 60 * 1000;
+const OVERLAY_MAX_OBJECTS = 25_000;
 const DEFAULT_OBJECT_COUNT_ESTIMATE = 1_350_000;
-const FETCH_TIMEOUT_MS = 45000;
+const FETCH_TIMEOUT_MS = 45_000;
 const MAX_FETCH_RETRIES = 2;
 const CACHE_TTL_MS = 10 * 60 * 1000;
 const SEARCH_RESULT_LIMIT = 40;
+const SEARCH_QUERY_MAX_LEN = 80;
 
 let cacheEntry = null;
+let localCatalogManifest = null;
 let lastAvailableCountEstimate = DEFAULT_OBJECT_COUNT_ESTIMATE;
+let overlayUpdatesById = new Map();
+let isOverlayRefreshInFlight = false;
+let backgroundTimer = null;
 
 const mimeByExt = Object.freeze({
   ".html": "text/html; charset=utf-8",
@@ -58,12 +73,17 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && requestUrl.pathname === "/api/main-belt") {
-      await handleMainBeltApi(req, res);
+      await handleMainBeltApi(res);
       return;
     }
 
     if (req.method === "GET" && requestUrl.pathname === "/api/search") {
       await handleSearchApi(requestUrl, res);
+      return;
+    }
+
+    if (req.method === "GET" && requestUrl.pathname === "/api/stats") {
+      await handleStatsApi(res);
       return;
     }
 
@@ -80,9 +100,83 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Asteroid Explorer server running on http://localhost:${PORT}`);
+  void initializeCatalogLayer();
 });
 
-async function handleMainBeltApi(_req, res) {
+async function initializeCatalogLayer() {
+  const loaded = await ensureCatalogLayerReady();
+  if (!loaded) {
+    console.log("No local catalog manifest detected. Using direct API sampling mode.");
+  }
+}
+
+async function ensureCatalogLayerReady() {
+  if (localCatalogManifest) {
+    return true;
+  }
+
+  const manifest = await loadLocalCatalogManifest();
+  if (!manifest) {
+    return false;
+  }
+
+  localCatalogManifest = manifest;
+  console.log(
+    `Loaded local catalog manifest: ${localCatalogManifest.totalCount} objects, ` +
+      `${localCatalogManifest.chunkFiles.length} chunks.`
+  );
+  startBackgroundOverlayRefreshLoop();
+  return true;
+}
+
+function startBackgroundOverlayRefreshLoop() {
+  if (backgroundTimer) {
+    clearInterval(backgroundTimer);
+  }
+  setTimeout(() => {
+    void refreshOverlayFromApi();
+  }, 7_000);
+
+  backgroundTimer = setInterval(() => {
+    void refreshOverlayFromApi();
+  }, BACKGROUND_UPDATE_INTERVAL_MS);
+}
+
+async function refreshOverlayFromApi() {
+  if (isOverlayRefreshInFlight) {
+    return;
+  }
+  isOverlayRefreshInFlight = true;
+
+  try {
+    const payload = await fetchMainBeltFromJpl(BACKGROUND_UPDATE_SAMPLE);
+    upsertOverlay(payload.asteroids);
+    cacheEntry = null;
+  } catch (error) {
+    console.warn(`Background overlay refresh failed: ${error.message}`);
+  } finally {
+    isOverlayRefreshInFlight = false;
+  }
+}
+
+function upsertOverlay(records) {
+  for (const record of records) {
+    if (!record?.id) {
+      continue;
+    }
+    if (overlayUpdatesById.has(record.id)) {
+      overlayUpdatesById.delete(record.id);
+    }
+    overlayUpdatesById.set(record.id, record);
+    while (overlayUpdatesById.size > OVERLAY_MAX_OBJECTS) {
+      const oldestKey = overlayUpdatesById.keys().next().value;
+      overlayUpdatesById.delete(oldestKey);
+    }
+  }
+}
+
+async function handleMainBeltApi(res) {
+  await ensureCatalogLayerReady();
   const now = Date.now();
   if (cacheEntry && now - cacheEntry.cachedAt < CACHE_TTL_MS) {
     sendJson(res, 200, cacheEntry.payload, {
@@ -92,48 +186,83 @@ async function handleMainBeltApi(_req, res) {
   }
 
   try {
-    const payload = await fetchMainBeltFromJpl();
+    const payload = localCatalogManifest
+      ? await fetchMainBeltFromLocalCatalog()
+      : await fetchMainBeltFromJpl(SAMPLE_OBJECTS);
+
     cacheEntry = { cachedAt: now, payload };
     sendJson(res, 200, payload, {
       "Cache-Control": "public, max-age=60"
     });
   } catch (error) {
-    const fallback = await readFallbackDataset();
-    fallback.meta = {
-      ...fallback.meta,
-      source: `${fallback.meta?.source || "local-fallback"} (upstream unavailable)`,
-      warning: "Live JPL API unavailable. Serving local fallback snapshot."
-    };
-    sendJson(res, 200, fallback, {
-      "Cache-Control": "no-store"
-    });
+    try {
+      const fallback = await readFallbackDataset();
+      fallback.meta = {
+        ...fallback.meta,
+        source: `${fallback.meta?.source || "local-fallback"} (upstream unavailable)`,
+        warning: "Live JPL API unavailable. Serving fallback snapshot."
+      };
+      sendJson(res, 200, fallback, {
+        "Cache-Control": "no-store"
+      });
+    } catch {
+      sendJson(res, 502, {
+        error: "Failed to load asteroid data.",
+        detail: error.message
+      });
+    }
   }
 }
 
-async function fetchMainBeltFromJpl() {
-  const initialMaxOffset = Math.max(0, lastAvailableCountEstimate - SAMPLE_OBJECTS);
+async function fetchMainBeltFromLocalCatalog() {
+  if (!localCatalogManifest || !Array.isArray(localCatalogManifest.chunkFiles) || !localCatalogManifest.chunkFiles.length) {
+    throw new Error("Local catalog manifest is unavailable.");
+  }
+
+  const chunkFile = localCatalogManifest.chunkFiles[randomIntInclusive(0, localCatalogManifest.chunkFiles.length - 1)];
+  const chunkPath = path.join(CATALOG_DIR, "chunks", chunkFile);
+  const chunkPayload = JSON.parse(await fsPromises.readFile(chunkPath, "utf8"));
+  const chunkObjects = Array.isArray(chunkPayload.asteroids) ? chunkPayload.asteroids : [];
+  if (!chunkObjects.length) {
+    throw new Error(`Selected catalog chunk is empty: ${chunkFile}`);
+  }
+
+  const overlayObjects = Array.from(overlayUpdatesById.values());
+  const merged = dedupeById([...chunkObjects, ...overlayObjects]);
+  const sampled = merged.length > SAMPLE_OBJECTS ? randomSampleArray(merged, SAMPLE_OBJECTS) : merged;
+
+  return {
+    meta: {
+      source: "Local catalog snapshot + live API overlay",
+      fetchedAt: new Date().toISOString(),
+      loadedCount: sampled.length,
+      availableCount: Number(localCatalogManifest.totalCount) || null,
+      sampleMode: "local-chunk",
+      sampleChunk: chunkFile,
+      overlayCount: overlayObjects.length,
+      catalogGeneratedAt: localCatalogManifest.generatedAt
+    },
+    asteroids: sampled
+  };
+}
+
+async function fetchMainBeltFromJpl(sampleSize) {
+  const initialMaxOffset = Math.max(0, lastAvailableCountEstimate - sampleSize);
   let sampleOffset = randomIntInclusive(0, initialMaxOffset);
-  let payload = await fetchJsonWithRetries(
-    buildJplRequestUrl(SAMPLE_OBJECTS, sampleOffset),
-    FETCH_TIMEOUT_MS,
-    MAX_FETCH_RETRIES
-  );
+  let payload = await fetchJsonWithRetries(buildJplRequestUrl(sampleSize, sampleOffset), FETCH_TIMEOUT_MS, MAX_FETCH_RETRIES);
 
   let fields = Array.isArray(payload.fields) ? payload.fields : [];
   let rows = Array.isArray(payload.data) ? payload.data : [];
   let fieldIndex = createFieldIndex(fields);
   let availableCount = Number.isFinite(Number(payload.count)) ? Number(payload.count) : null;
+
   if (Number.isFinite(availableCount)) {
     lastAvailableCountEstimate = availableCount;
   }
 
   if (!rows.length && Number.isFinite(availableCount) && sampleOffset > 0) {
-    sampleOffset = Math.max(0, availableCount - SAMPLE_OBJECTS);
-    payload = await fetchJsonWithRetries(
-      buildJplRequestUrl(SAMPLE_OBJECTS, sampleOffset),
-      FETCH_TIMEOUT_MS,
-      MAX_FETCH_RETRIES
-    );
+    sampleOffset = Math.max(0, availableCount - sampleSize);
+    payload = await fetchJsonWithRetries(buildJplRequestUrl(sampleSize, sampleOffset), FETCH_TIMEOUT_MS, MAX_FETCH_RETRIES);
     fields = Array.isArray(payload.fields) ? payload.fields : [];
     rows = Array.isArray(payload.data) ? payload.data : [];
     fieldIndex = createFieldIndex(fields);
@@ -143,17 +272,17 @@ async function fetchMainBeltFromJpl() {
     }
   }
 
-  const deduped = dedupeById(rows.map((row) => mapRowToAsteroid(row, fieldIndex)).filter(Boolean));
+  const asteroids = dedupeById(rows.map((row) => mapRowToAsteroid(row, fieldIndex)).filter(Boolean));
   return {
     meta: {
       source: "NASA/JPL SBDB Query API",
       fetchedAt: new Date().toISOString(),
-      loadedCount: deduped.length,
+      loadedCount: asteroids.length,
       availableCount,
-      sampleMode: "random-window",
+      sampleMode: "random-window-api",
       sampleOffset
     },
-    asteroids: deduped
+    asteroids
   };
 }
 
@@ -170,18 +299,36 @@ function buildJplRequestUrl(limit, offset) {
 }
 
 async function handleSearchApi(requestUrl, res) {
-  const query = (requestUrl.searchParams.get("q") ?? "").trim();
+  await ensureCatalogLayerReady();
+  const rawQuery = (requestUrl.searchParams.get("q") ?? "").trim();
+  const query = rawQuery.slice(0, SEARCH_QUERY_MAX_LEN);
   const limit = clampInt(requestUrl.searchParams.get("limit"), 1, SEARCH_RESULT_LIMIT, 20);
 
   if (!query) {
     sendJson(res, 200, {
-      meta: { source: "NASA/JPL SBDB Search API", query, loadedCount: 0, availableCount: null },
+      meta: { source: "Local/API search", query, loadedCount: 0, availableCount: null },
       asteroids: []
     });
     return;
   }
 
   try {
+    const localMatches = await searchLocalCatalog(query, limit);
+    if (localMatches.length > 0) {
+      sendJson(res, 200, {
+        meta: {
+          source: "Local catalog search index",
+          query,
+          loadedCount: localMatches.length,
+          availableCount: null
+        },
+        asteroids: localMatches
+      }, {
+        "Cache-Control": "no-store"
+      });
+      return;
+    }
+
     const pdesValues = await resolveQueryToPdes(query, limit);
     if (!pdesValues.length) {
       sendJson(res, 200, {
@@ -194,9 +341,10 @@ async function handleSearchApi(requestUrl, res) {
     const payload = await fetchAsteroidsByPdes(pdesValues);
     payload.meta = {
       ...payload.meta,
-      source: "NASA/JPL SBDB Query API (search)",
+      source: "NASA/JPL SBDB Query API (search fallback)",
       query
     };
+    upsertOverlay(payload.asteroids);
     sendJson(res, 200, payload, {
       "Cache-Control": "no-store"
     });
@@ -206,6 +354,94 @@ async function handleSearchApi(requestUrl, res) {
       detail: error.message
     });
   }
+}
+
+async function searchLocalCatalog(query, limit) {
+  if (!localCatalogManifest) {
+    return [];
+  }
+
+  const searchIndexFile = localCatalogManifest.searchIndexFile || "search-index.ndjson";
+  const searchIndexPath = path.join(CATALOG_DIR, searchIndexFile);
+  if (!(await fileExists(searchIndexPath))) {
+    return [];
+  }
+
+  const queryLower = query.toLowerCase();
+  const matches = [];
+
+  const stream = fs.createReadStream(searchIndexPath, { encoding: "utf8" });
+  const reader = readline.createInterface({
+    input: stream,
+    crlfDelay: Infinity
+  });
+
+  try {
+    for await (const line of reader) {
+      if (!line) {
+        continue;
+      }
+      let record;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        continue;
+      }
+
+      if (matchesQuery(record, queryLower)) {
+        matches.push(record);
+      }
+      if (matches.length >= limit) {
+        break;
+      }
+    }
+  } finally {
+    reader.close();
+    stream.destroy();
+  }
+
+  if (!matches.length) {
+    return [];
+  }
+  return loadLocalCatalogMatches(matches);
+}
+
+function matchesQuery(record, queryLower) {
+  const id = String(record.id ?? "").toLowerCase();
+  const nameLower = String(record.nameLower ?? "");
+  const pdesLower = String(record.pdesLower ?? "");
+  return id.includes(queryLower) || nameLower.includes(queryLower) || pdesLower.includes(queryLower);
+}
+
+async function loadLocalCatalogMatches(matches) {
+  const grouped = new Map();
+  for (const match of matches) {
+    if (!match.chunk || !Number.isFinite(match.row)) {
+      continue;
+    }
+    if (!grouped.has(match.chunk)) {
+      grouped.set(match.chunk, []);
+    }
+    grouped.get(match.chunk).push(match.row);
+  }
+
+  const outputById = new Map();
+  for (const [chunkFile, rowIndexes] of grouped.entries()) {
+    const chunkPath = path.join(CATALOG_DIR, "chunks", chunkFile);
+    if (!(await fileExists(chunkPath))) {
+      continue;
+    }
+    const chunkPayload = JSON.parse(await fsPromises.readFile(chunkPath, "utf8"));
+    const rows = Array.isArray(chunkPayload.asteroids) ? chunkPayload.asteroids : [];
+    for (const rowIndex of rowIndexes) {
+      const row = rows[rowIndex];
+      if (row?.id) {
+        outputById.set(row.id, row);
+      }
+    }
+  }
+
+  return Array.from(outputById.values());
 }
 
 async function resolveQueryToPdes(query, limit) {
@@ -261,26 +497,41 @@ async function fetchAsteroidsByPdes(pdesValues) {
     "sb-cdata": cdata,
     limit: String(safePdes.length)
   });
-
-  const payload = await fetchJsonWithRetries(
-    `${API_BASE_URL}?${params.toString()}`,
-    FETCH_TIMEOUT_MS,
-    MAX_FETCH_RETRIES
-  );
+  const payload = await fetchJsonWithRetries(`${API_BASE_URL}?${params.toString()}`, FETCH_TIMEOUT_MS, MAX_FETCH_RETRIES);
 
   const fields = Array.isArray(payload.fields) ? payload.fields : [];
   const rows = Array.isArray(payload.data) ? payload.data : [];
   const fieldIndex = createFieldIndex(fields);
-  const deduped = dedupeById(rows.map((row) => mapRowToAsteroid(row, fieldIndex)).filter(Boolean));
+  const asteroids = dedupeById(rows.map((row) => mapRowToAsteroid(row, fieldIndex)).filter(Boolean));
 
   return {
     meta: {
       fetchedAt: new Date().toISOString(),
-      loadedCount: deduped.length,
+      loadedCount: asteroids.length,
       availableCount: null
     },
-    asteroids: deduped
+    asteroids
   };
+}
+
+async function handleStatsApi(res) {
+  await ensureCatalogLayerReady();
+  if (!localCatalogManifest) {
+    sendJson(res, 404, { error: "No local precomputed stats available." });
+    return;
+  }
+
+  const statsFile = localCatalogManifest.statsFile || "precomputed-stats.json";
+  const statsPath = path.join(CATALOG_DIR, statsFile);
+  if (!(await fileExists(statsPath))) {
+    sendJson(res, 404, { error: "Precomputed stats file not found." });
+    return;
+  }
+
+  const statsPayload = JSON.parse(await fsPromises.readFile(statsPath, "utf8"));
+  sendJson(res, 200, statsPayload, {
+    "Cache-Control": "public, max-age=300"
+  });
 }
 
 async function fetchJsonWithTimeout(url, timeoutMs) {
@@ -304,7 +555,6 @@ async function fetchJsonWithTimeout(url, timeoutMs) {
 
 async function fetchJsonWithRetries(url, timeoutMs, maxRetries) {
   let lastError = null;
-
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     try {
       return await fetchJsonWithTimeout(url, timeoutMs);
@@ -316,8 +566,7 @@ async function fetchJsonWithRetries(url, timeoutMs, maxRetries) {
       await sleep(500 * (attempt + 1));
     }
   }
-
-  throw lastError ?? new Error("Unknown upstream fetch error.");
+  throw lastError ?? new Error("Unknown fetch failure.");
 }
 
 function createFieldIndex(fields) {
@@ -342,6 +591,7 @@ function mapRowToAsteroid(row, fieldIndex) {
   return {
     id: String(id),
     name: String(name).trim(),
+    primaryDesignation: sanitizeText(pickField(row, fieldIndex, "pdes")),
     classCode: String(pickField(row, fieldIndex, "class") ?? "Unknown"),
     zone: classifyBeltZone(a),
     a,
@@ -374,6 +624,14 @@ function toNumber(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function sanitizeText(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const cleaned = String(value).trim();
+  return cleaned || null;
+}
+
 function periodYearsFromSemiMajorAxis(a) {
   if (!Number.isFinite(a) || a <= 0) {
     return null;
@@ -402,14 +660,51 @@ function dedupeById(records) {
   return Array.from(byId.values());
 }
 
+function randomSampleArray(items, targetSize) {
+  if (items.length <= targetSize) {
+    return items;
+  }
+  const step = items.length / targetSize;
+  const output = [];
+  for (let index = 0; index < targetSize; index += 1) {
+    output.push(items[Math.floor(index * step)]);
+  }
+  return output;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function readFallbackDataset() {
   const fallbackPath = path.join(ROOT_DIR, "data", "main-belt-fallback.json");
-  const text = await fs.readFile(fallbackPath, "utf8");
-  return JSON.parse(text);
+  return JSON.parse(await fsPromises.readFile(fallbackPath, "utf8"));
+}
+
+async function loadLocalCatalogManifest() {
+  if (!(await fileExists(CATALOG_MANIFEST_PATH))) {
+    return null;
+  }
+
+  try {
+    const manifest = JSON.parse(await fsPromises.readFile(CATALOG_MANIFEST_PATH, "utf8"));
+    if (!Array.isArray(manifest.chunkFiles) || !manifest.chunkFiles.length) {
+      return null;
+    }
+    return manifest;
+  } catch (error) {
+    console.warn(`Failed to parse catalog manifest: ${error.message}`);
+    return null;
+  }
+}
+
+async function fileExists(filePath) {
+  try {
+    await fsPromises.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function serveStatic(urlPathname, method, res) {
@@ -425,7 +720,7 @@ async function serveStatic(urlPathname, method, res) {
 
   let content;
   try {
-    content = await fs.readFile(filePath);
+    content = await fsPromises.readFile(filePath);
   } catch {
     sendJson(res, 404, { error: "Not found" });
     return;
@@ -433,8 +728,8 @@ async function serveStatic(urlPathname, method, res) {
 
   const ext = path.extname(filePath).toLowerCase();
   const contentType = mimeByExt[ext] || "application/octet-stream";
-
   res.writeHead(200, buildSecurityHeaders({ "Content-Type": contentType }));
+
   if (method === "HEAD") {
     res.end();
     return;
