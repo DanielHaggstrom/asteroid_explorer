@@ -10,7 +10,6 @@
   "scripts": {
     "dev": "node server.mjs",
     "serve": "node server.mjs",
-    "serve:static": "python -m http.server 4173",
     "test": "node tests/utils.test.mjs"
   }
 }

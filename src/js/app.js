@@ -61,9 +61,7 @@ async function bootstrap() {
 
   try {
     const result = await loadMainBeltAsteroids({
-      maxObjects: APP_CONFIG.maxObjects,
-      pageSize: APP_CONFIG.pageSize,
-      timeoutMs: APP_CONFIG.fetchTimeoutMs
+      proxyTimeoutMs: APP_CONFIG.proxyFetchTimeoutMs
     });
 
     state.allAsteroids = result.asteroids;

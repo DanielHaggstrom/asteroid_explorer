@@ -24,9 +24,9 @@ const API_FIELDS = [
   "H",
   "epoch"
 ];
-const PAGE_SIZE = 200;
 const MAX_OBJECTS = 1200;
-const FETCH_TIMEOUT_MS = 12000;
+const FETCH_TIMEOUT_MS = 45000;
+const MAX_FETCH_RETRIES = 2;
 const CACHE_TTL_MS = 10 * 60 * 1000;
 
 let cacheEntry = null;
@@ -102,44 +102,23 @@ async function handleMainBeltApi(_req, res) {
 }
 
 async function fetchMainBeltFromJpl() {
+  const requestUrl = buildJplRequestUrl(MAX_OBJECTS, 0);
+  const payload = await fetchJsonWithRetries(requestUrl, FETCH_TIMEOUT_MS, MAX_FETCH_RETRIES);
+
+  const fields = Array.isArray(payload.fields) ? payload.fields : [];
+  const rows = Array.isArray(payload.data) ? payload.data : [];
+  const fieldIndex = createFieldIndex(fields);
   const records = [];
-  let offset = 0;
-  let availableCount = null;
 
-  while (records.length < MAX_OBJECTS) {
-    const limit = Math.min(PAGE_SIZE, MAX_OBJECTS - records.length);
-    const requestUrl = buildJplRequestUrl(limit, offset);
-    const payload = await fetchJsonWithTimeout(requestUrl, FETCH_TIMEOUT_MS);
-
-    const fields = Array.isArray(payload.fields) ? payload.fields : [];
-    const rows = Array.isArray(payload.data) ? payload.data : [];
-    const fieldIndex = createFieldIndex(fields);
-
-    if (Number.isFinite(Number(payload.count))) {
-      availableCount = Number(payload.count);
-    }
-
-    if (!rows.length) {
-      break;
-    }
-
-    for (const row of rows) {
-      const mapped = mapRowToAsteroid(row, fieldIndex);
-      if (mapped) {
-        records.push(mapped);
-      }
-    }
-
-    offset += rows.length;
-    if (availableCount !== null && offset >= availableCount) {
-      break;
-    }
-    if (rows.length < limit) {
-      break;
+  for (const row of rows) {
+    const mapped = mapRowToAsteroid(row, fieldIndex);
+    if (mapped) {
+      records.push(mapped);
     }
   }
 
   const deduped = dedupeById(records);
+  const availableCount = Number.isFinite(Number(payload.count)) ? Number(payload.count) : null;
   return {
     meta: {
       source: "NASA/JPL SBDB Query API",
@@ -180,6 +159,24 @@ async function fetchJsonWithTimeout(url, timeoutMs) {
   } finally {
     clearTimeout(timeoutHandle);
   }
+}
+
+async function fetchJsonWithRetries(url, timeoutMs, maxRetries) {
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      return await fetchJsonWithTimeout(url, timeoutMs);
+    } catch (error) {
+      lastError = error;
+      if (attempt >= maxRetries) {
+        break;
+      }
+      await sleep(500 * (attempt + 1));
+    }
+  }
+
+  throw lastError ?? new Error("Unknown upstream fetch error.");
 }
 
 function createFieldIndex(fields) {
@@ -262,6 +259,10 @@ function dedupeById(records) {
     byId.set(record.id, record);
   }
   return Array.from(byId.values());
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function readFallbackDataset() {
