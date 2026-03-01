@@ -4,6 +4,13 @@
   "private": true,
   "type": "module",
   "description": "Browser dashboard for exploring asteroid-belt objects using official JPL SBDB API data.",
+  "author": "Daniel Häggström Pérez-Flecha",
+  "license": "MIT",
+  "homepage": "https://asteroid-explorer.onrender.com/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DanielHaggstrom/asteroid_explorer.git"
+  },
   "engines": {
     "node": ">=18"
   },

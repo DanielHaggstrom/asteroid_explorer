@@ -3,7 +3,10 @@
 ## Product Objective
 Build a browser-based asteroid-belt exploration dashboard that helps users understand population patterns, orbital structure, and individual-object properties using official, public scientific data.
 
-## Phase 1: Production MVP (Current Target)
+## Current Status
+Phase 1 is shipped and publicly deployed at `https://asteroid-explorer.onrender.com/`.
+
+## Phase 1: Production MVP
 1. Data foundation
 - Integrate JPL SBDB Query API for main-belt asteroid data.
 - Normalize and validate key fields (orbital and physical parameters).

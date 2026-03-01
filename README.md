@@ -2,6 +2,12 @@
 
 Browser-based dashboard for visual and intuitive exploration of main-belt asteroids using official NASA/JPL public API data.
 
+## Live App
+- Production deployment: https://asteroid-explorer.onrender.com/
+- Health check: https://asteroid-explorer.onrender.com/healthz
+
+Free Render instances can cold-start after inactivity, so the first request may take a short moment.
+
 ## What This Builds
 1. Population-level understanding:
 - Fine-grained size category counts.
@@ -29,6 +35,7 @@ The project starts with visualizations that provide high explanatory value for t
 
 See:
 - [Roadmap](docs/ROADMAP.md)
+- [Deployment notes](docs/DEPLOYMENT.md)
 - [Visualization notes](docs/VISUALIZATIONS.md)
 
 ## Data Source
@@ -88,6 +95,9 @@ Recommended deployment is Node hosting (Render, Railway, Fly.io, etc.) so the sa
 
 Static-only hosting is not supported for live data in this version because the client is intentionally proxy-only.
 
+Current public deployment:
+- Render web service: https://asteroid-explorer.onrender.com/
+
 Recommended production settings:
 1. HTTPS enforced.
 2. Security headers enabled (see [SECURITY.md](SECURITY.md)).
@@ -103,3 +113,6 @@ Current tests cover core data-math helpers:
 1. Diameter bucketing.
 2. Belt-zone classification.
 3. Kepler solver and orbital position output sanity.
+
+## Author
+- Daniel Häggström Pérez-Flecha
