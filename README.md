@@ -1,4 +1,4 @@
-# Asteroid Belt Explorer
+﻿# Asteroid Belt Explorer
 
 Browser-based dashboard for visual and intuitive exploration of main-belt asteroids using official NASA/JPL public API data.
 
@@ -8,65 +8,44 @@ Browser-based dashboard for visual and intuitive exploration of main-belt astero
 
 Free Render instances can cold-start after inactivity, so the first request may take a short moment.
 
-## What This Builds
-1. Population-level understanding:
-- Fine-grained size category counts.
-- Orbital distribution (`a` vs `e`) with inclination color cue.
-- Semi-major-axis density profile with resonance markers (Kirkwood-gap context).
-- True-anomaly angular distribution histogram.
-- Key summary metrics.
+## What The App Does
+1. Shows a prepared sample of main-belt asteroids immediately at startup for fast first paint.
+2. Uses that sample for charts, KPIs, and the belt navigator.
+3. Uses the live JPL APIs for full-catalog pagination, sorting, filtering, and object search.
+4. Pins a searched or table-selected object into the live sample so it appears on the map and charts even if it was not part of the prepared sample.
+5. Refreshes the loaded sample in memory in the background while the service is running.
 
-2. Spatial intuition:
-- Top-down belt navigator using orbital elements for approximate object placement.
+## Key Views
+1. Population by size category.
+2. Semi-major axis vs eccentricity scatter plot.
+3. Semi-major axis density histogram with Kirkwood resonance guides.
+4. True-anomaly histogram.
+5. Belt navigator map.
+6. Full-catalog browser with server-side pagination.
+7. Selected-object details panel.
 
-3. Object-level inspection:
-- Search/filter + sortable/paginated table + clickable map.
-- Detail panel for selected asteroid.
-
-## Chosen Visualization Objectives
-The project starts with visualizations that provide high explanatory value for the belt while staying robust in-browser:
-1. Size distribution bar chart.
-2. Orbital scatter chart.
-3. Semi-major-axis density histogram with resonance guides.
-4. True-anomaly distribution histogram.
-5. Belt map navigator.
-6. KPI cards.
-7. Searchable object list + details pane.
-
-See:
-- [Roadmap](docs/ROADMAP.md)
-- [Deployment notes](docs/DEPLOYMENT.md)
+More detail:
 - [Visualization notes](docs/VISUALIZATIONS.md)
+- [Data-source notes](docs/DATA_SOURCES.md)
+- [Deployment notes](docs/DEPLOYMENT.md)
+- [Roadmap](docs/ROADMAP.md)
 
-## Data Source
-Primary source:
-- NASA/JPL SBDB Query API: `https://ssd-api.jpl.nasa.gov/sbdb_query.api`
+## Data Model
+This project intentionally uses a hybrid model that fits Render's free-tier constraints.
 
-Runtime access model:
-1. Browser calls same-origin `/api/main-belt` (Node proxy).
-2. If local catalog files exist, proxy serves random sampled chunks from local storage.
-3. If no local catalog is present, the server can serve a bundled startup snapshot for fast cold starts and then refresh live data in the background.
-4. Search uses local catalog index first; if no local match is found, it falls back to JPL API search.
-5. Background API refresh updates an in-memory overlay for fresher objects.
-6. If upstream is unavailable, app serves local fallback snapshot (`data/main-belt-fallback.json`).
+1. `data/main-belt-startup.json`
+- Prepared startup sample committed into the repo.
+- Includes a fixed set of non-negotiable scientifically important bodies.
+- Used for initial charts, KPIs, and the belt navigator.
 
-By default, the proxy loads a random live sample window of 20,000 main-belt objects per refresh for interactive performance (the API itself has far more).
+2. Live JPL APIs
+- `GET /api/catalog` pages through the full main-belt catalog via NASA/JPL.
+- `GET /api/search` resolves named bodies and designations via NASA/JPL.
+- Runtime refresh updates only the currently loaded sample in memory.
 
-Reference docs:
-- https://ssd-api.jpl.nasa.gov/doc/sbdb_query.html
-- [Data source notes](docs/DATA_SOURCES.md)
-
-## Project Structure
-```
-asteroid_explorer/
-  docs/
-  src/
-    css/
-    js/
-  tests/
-  index.html
-  SECURITY.md
-```
+Reference APIs:
+- SBDB Query API: `https://ssd-api.jpl.nasa.gov/sbdb_query.api`
+- SBDB Object API: `https://ssd-api.jpl.nasa.gov/sbdb.api`
 
 ## Local Run
 Requirements:
@@ -74,6 +53,7 @@ Requirements:
 
 Commands:
 ```bash
+npm install
 npm test
 npm run dev
 ```
@@ -81,39 +61,51 @@ npm run dev
 Then open:
 - `http://localhost:4173`
 
-### Build Local Full Catalog Snapshot
+## Refresh The Prepared Sample
+Regenerate `data/main-belt-startup.json` with the current JPL data:
+
 ```bash
-npm run catalog:build
+npm run sample:update
 ```
 
-This downloads the full MBA catalog into chunked files under `data/catalog/`, writes a local search index, and precomputes aggregate stats used by the server.
+Optional flags:
+```bash
+node scripts/update_startup_sample.mjs --size=12000
+node scripts/update_startup_sample.mjs --commit
+```
 
-When a catalog snapshot is present, optional precomputed stats are available at:
-- `GET /api/stats`
+What this command does:
+1. Pulls the current main-belt count from JPL.
+2. Re-fetches all required core bodies from `config/startup-sample-core-bodies.json`.
+3. Fills the rest of the startup sample from random JPL catalog windows.
+4. Writes the updated prepared sample back to `data/main-belt-startup.json`.
+5. Optionally auto-commits only the sample artifacts.
 
-## Production/Publishing
-Recommended deployment is Node hosting (Render, Railway, Fly.io, etc.) so the same-origin proxy avoids browser CORS/network issues against third-party APIs.
+## Deployment
+This repo is Render-first, but not Render-only.
 
-Static-only hosting is not supported for live data in this version because the client is intentionally proxy-only.
+1. Reference deployment target: Render Node web service.
+2. Works on any Node host that can make outbound HTTPS requests to the JPL APIs.
+3. Static-only hosting is not enough because the app depends on same-origin API endpoints served by `server.mjs`.
 
-Current public deployment:
-- Render web service: https://asteroid-explorer.onrender.com/
+Current production deployment:
+- https://asteroid-explorer.onrender.com/
 
-Recommended production settings:
-1. HTTPS enforced.
-2. Security headers enabled (see [SECURITY.md](SECURITY.md)).
-3. Optional scheduled data snapshot strategy if you want deterministic datasets rather than live API calls.
+Recommended Render settings:
+1. Runtime: `Node`
+2. Build command: `npm install`
+3. Start command: `npm run serve`
 
 ## No-Secrets Policy
 1. No API key is required.
-2. `.env*` is ignored.
-3. Do not embed any private tokens in frontend code.
+2. No secrets are embedded in the client or server.
+3. `.env*` remains ignored for future extensions, but this project does not currently need any environment secrets.
 
 ## Testing
-Current tests cover core data-math helpers:
+Current tests cover the core math and categorization helpers used by the frontend:
 1. Diameter bucketing.
 2. Belt-zone classification.
-3. Kepler solver and orbital position output sanity.
+3. Kepler solver and orbital-position sanity.
 
 ## Author
-- Daniel Häggström Pérez-Flecha
+Daniel Häggström Pérez-Flecha

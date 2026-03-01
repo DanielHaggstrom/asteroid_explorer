@@ -1,30 +1,42 @@
-# Official Data Sources
+﻿# Official Data Sources
 
-## Primary Source
-1. NASA JPL Small-Body Database Query API (SBDB Query API)
+## Primary APIs
+1. NASA/JPL Small-Body Database Query API (SBDB Query API)
 - Endpoint: `https://ssd-api.jpl.nasa.gov/sbdb_query.api`
-- Usage in this project:
-  - `sb-kind=a` (asteroids)
-  - `sb-class=MBA` (main-belt asteroids)
-  - field selection for orbital + physical parameters
-  - pagination with `limit` and `limit-from`
+- Used for:
+  - startup-sample refresh tooling
+  - server-side catalog pagination
+  - catalog sorting and filter constraints
+  - fetching object records by designation or SPK-ID
+
+2. NASA/JPL Small-Body Database Object API (SBDB Object API)
+- Endpoint: `https://ssd-api.jpl.nasa.gov/sbdb.api`
+- Used for:
+  - resolving direct object searches such as `Ceres`, `Vesta`, or known designations
 
 ## Retrieved Fields
 1. Identity: `spkid`, `full_name`, `pdes`, `class`
 2. Orbital: `a`, `e`, `i`, `om`, `w`, `ma`, `epoch`
 3. Physical: `diameter`, `albedo`, `H`
 
+## Runtime Data Flow
+1. Browser requests same-origin `GET /api/main-belt`.
+2. The Node server serves the prepared startup sample from `data/main-belt-startup.json`.
+3. Browser renders charts, KPIs, and the map from that startup sample.
+4. Browser requests `GET /api/catalog` for the table.
+5. The Node server proxies table pagination, sorting, and filters to the live JPL Query API.
+6. Browser requests `GET /api/search?q=...` for object lookup.
+7. The Node server uses the live JPL APIs to resolve search results.
+8. When an object is selected, the client pins it into the live sample so it becomes visible in the charts and belt navigator.
+9. Separately, the server refreshes part of the loaded sample in memory in the background.
+
+## Prepared Sample Rules
+1. The startup sample is intentionally smaller than the full catalog for browser responsiveness.
+2. `config/startup-sample-core-bodies.json` defines bodies that must always survive sample regeneration.
+3. `npm run sample:update` rebuilds the prepared sample from current JPL data.
+
 ## Data Handling Notes
 1. Numeric parsing is strict; invalid values become `null`.
-2. Dashboard analytics operate on currently loaded records.
-3. Missing physical values are expected and explicitly visualized.
-
-## Delivery Strategy
-1. Browser requests same-origin endpoint `/api/main-belt`.
-2. Node server proxies and normalizes JPL data to avoid client CORS/network failures.
-3. If local snapshot files are available (`data/catalog/manifest.json`), `/api/main-belt` samples from local chunks first.
-4. If no local catalog is present, a bundled startup sample (`data/main-belt-startup.json`) can be served immediately while live data warms in the background.
-5. `/api/search?q=...` searches local index first; only if local misses does it query live SBDB APIs.
-6. Background refresh periodically pulls live API windows and overlays fresher records in-memory.
-7. If JPL is unavailable and no local snapshot is available, fallback snapshot (`data/main-belt-fallback.json`) keeps UI functional.
-8. Client-side direct calls to JPL are intentionally disabled.
+2. Missing physical values are expected and rendered explicitly as `Unknown`.
+3. Aggregate charts describe the loaded sample, not the entire 1.3M+ object catalog.
+4. Full-catalog browsing is available through the API-backed table rather than by loading the whole catalog into the browser.

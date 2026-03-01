@@ -1,4 +1,4 @@
-# Security Notes
+﻿# Security Notes
 
 ## Secret Handling
 1. This project does not require API keys.
@@ -8,19 +8,18 @@
 ## Frontend Safety Controls
 1. Strict Content Security Policy is defined in `index.html`.
 2. The app renders data with `textContent` and avoids unsafe HTML insertion.
-3. Browser uses same-origin API route (`/api/main-belt`) instead of arbitrary cross-origin calls.
+3. The browser talks only to same-origin endpoints served by `server.mjs`.
 
 ## Backend Safety Controls
-1. Proxy endpoint is fixed-purpose (`/api/main-belt`) and does not expose open URL forwarding.
-2. Input surface is minimal and methods are restricted (`GET` for API and static files).
+1. The server exposes fixed-purpose routes only: `/api/main-belt`, `/api/catalog`, `/api/search`, and `/healthz`.
+2. Methods are restricted to `GET` for API routes and static assets.
 3. Security headers are set by the server (`nosniff`, referrer policy, permissions policy).
-4. Upstream failures fall back to local snapshot to avoid partial broken UI states.
+4. Static-path resolution is normalized to block path traversal.
+5. Search and catalog filters are normalized before being forwarded upstream.
 
 ## Operational Hardening Checklist
 1. Serve over HTTPS only.
-2. Add response headers in hosting platform:
-- `X-Content-Type-Options: nosniff`
-- `Referrer-Policy: strict-origin-when-cross-origin`
-- `Permissions-Policy` with minimal required capabilities
-3. Monitor API availability and rate-limit behavior.
-4. Keep dependencies minimal; this project currently has none at runtime.
+2. Keep the public deployment on a Node host with outbound access restricted to what the service actually needs.
+3. Monitor NASA/JPL API availability and latency.
+4. Refresh the committed startup sample periodically with `npm run sample:update`.
+5. Keep dependencies minimal; this project currently has no runtime package dependencies.
