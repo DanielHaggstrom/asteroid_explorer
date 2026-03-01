@@ -272,7 +272,7 @@ export function drawBeltMap(canvas, asteroids, selectedId, maxPoints) {
   ctx.arc(centerX, centerY, 7, 0, Math.PI * 2);
   ctx.fill();
 
-  const subset = downsampleAsteroids(asteroids, maxPoints);
+  const subset = downsampleAsteroids(asteroids, maxPoints, selectedId);
   const projectedPoints = [];
   for (const asteroid of subset) {
     const position = orbitalPositionFromElements(asteroid);
@@ -491,7 +491,7 @@ function prepareCanvas(canvas) {
   return { ctx, width: rect.width, height: rect.height };
 }
 
-function downsampleAsteroids(asteroids, maxPoints) {
+function downsampleAsteroids(asteroids, maxPoints, pinnedId = null) {
   if (asteroids.length <= maxPoints) {
     return asteroids;
   }
@@ -501,6 +501,14 @@ function downsampleAsteroids(asteroids, maxPoints) {
   for (let index = 0; index < maxPoints; index += 1) {
     output.push(asteroids[Math.floor(index * step)]);
   }
+
+  if (pinnedId && !output.some((asteroid) => asteroid.id === pinnedId)) {
+    const pinnedAsteroid = asteroids.find((asteroid) => asteroid.id === pinnedId);
+    if (pinnedAsteroid) {
+      output[output.length - 1] = pinnedAsteroid;
+    }
+  }
+
   return output;
 }
 
