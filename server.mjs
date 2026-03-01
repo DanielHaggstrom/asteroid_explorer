@@ -9,9 +9,7 @@ import {
   dedupeAsteroids,
   fetchJsonWithRetries,
   mapQueryPayloadToAsteroids,
-  sanitizeConstraintValue,
-  sanitizeSearchFragment,
-  titleCaseWords
+  sanitizeConstraintValue
 } from "./lib/jpl-api.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -347,23 +345,16 @@ async function fetchCatalogPage(query) {
 }
 
 async function searchAsteroids(rawQuery, limit) {
-  const exactPdes = await resolveExactPdesMatches(rawQuery, limit).catch(() => []);
-  const exactMatches = exactPdes.length > 0 ? await fetchAsteroidsByIdentifiers(exactPdes, "pdes") : [];
+  const localMatches = searchPreparedSample(rawQuery, limit);
+  const exactMatch = await resolveExactMatch(rawQuery).catch(() => null);
+  const exactMatches = exactMatch ? [exactMatch] : [];
+  const asteroids = dedupeAsteroids([...exactMatches, ...localMatches]).slice(0, limit);
 
-  const broadClauses = buildSearchClauses(rawQuery);
-  let broadMatches = [];
-  if (broadClauses.length > 0) {
-    broadMatches = await fetchAsteroidsByClauses(broadClauses, {
-      limit: Math.min(SEARCH_RESULT_LIMIT, limit * 2),
-      clauseMode: "OR",
-      sort: "-diameter"
-    });
-  }
-
-  const asteroids = dedupeAsteroids([...exactMatches, ...broadMatches]).slice(0, limit);
   return {
     meta: {
-      source: "NASA/JPL SBDB APIs",
+      source: exactMatches.length > 0
+        ? "Prepared startup sample + NASA/JPL exact lookup"
+        : "Prepared startup sample search",
       fetchedAt: new Date().toISOString(),
       query: rawQuery,
       loadedCount: asteroids.length,
@@ -373,32 +364,14 @@ async function searchAsteroids(rawQuery, limit) {
   };
 }
 
-async function resolveExactPdesMatches(query, limit) {
+async function resolveExactMatch(query) {
   const url = `${OBJECT_API_BASE_URL}?${new URLSearchParams({ sstr: query }).toString()}`;
   const payload = await fetchJsonWithRetries(url, {
     timeoutMs: FETCH_TIMEOUT_MS,
     maxRetries: MAX_FETCH_RETRIES
   });
 
-  const output = new Set();
-  const directCandidate = sanitizeConstraintValue(payload?.object?.pdes ?? payload?.object?.des);
-  if (directCandidate) {
-    output.add(directCandidate);
-  }
-
-  if (Array.isArray(payload?.list)) {
-    for (const item of payload.list) {
-      const candidate = sanitizeConstraintValue(item?.pdes ?? item?.des);
-      if (candidate) {
-        output.add(candidate);
-      }
-      if (output.size >= limit) {
-        break;
-      }
-    }
-  }
-
-  return Array.from(output).slice(0, limit);
+  return mapObjectPayloadToAsteroid(payload);
 }
 
 async function fetchRandomWindowSample(targetSize) {
@@ -513,29 +486,90 @@ function buildCatalogSort(sortKey, sortDirection) {
   return `${sortDirection === "desc" ? "-" : ""}${sortField}`;
 }
 
-function buildSearchClauses(rawQuery) {
-  const sanitized = sanitizeSearchFragment(rawQuery);
-  if (!sanitized || sanitized.length < 2) {
-    return /^\d+$/.test(rawQuery.trim()) ? [`pdes|EQ|${rawQuery.trim()}`] : [];
+function searchPreparedSample(rawQuery, limit) {
+  const query = rawQuery.trim().toLowerCase();
+  if (!query) {
+    return [];
   }
 
-  if (/^\d+$/.test(sanitized)) {
-    return [`pdes|EQ|${sanitized}`, `spkid|EQ|${sanitized}`];
+  const scored = [];
+  for (const asteroid of sampleState.asteroids) {
+    const name = asteroid.name?.toLowerCase() ?? "";
+    const designation = asteroid.primaryDesignation?.toLowerCase() ?? "";
+    const id = asteroid.id?.toLowerCase() ?? "";
+    const haystack = `${name} ${designation} ${id}`;
+    if (!haystack.includes(query)) {
+      continue;
+    }
+
+    let score = 1;
+    if (name === query || designation === query || id === query) {
+      score = 4;
+    } else if (name.startsWith(query) || designation.startsWith(query) || id.startsWith(query)) {
+      score = 3;
+    } else if (name.includes(query) || designation.includes(query)) {
+      score = 2;
+    }
+
+    scored.push({ asteroid, score });
   }
 
-  const clauses = [];
-  const variants = new Set([
-    sanitized,
-    titleCaseWords(sanitized),
-    sanitized.toUpperCase()
-  ]);
+  return scored
+    .sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+      return String(left.asteroid.name).localeCompare(String(right.asteroid.name));
+    })
+    .slice(0, limit)
+    .map((entry) => entry.asteroid);
+}
 
-  for (const variant of variants) {
-    clauses.push(`full_name|RE|${variant}`);
-    clauses.push(`pdes|RE|${variant}`);
+function mapObjectPayloadToAsteroid(payload) {
+  const object = payload?.object;
+  if (!object?.spkid || !object?.fullname) {
+    return null;
   }
 
-  return clauses;
+  const orbitElements = new Map(
+    Array.isArray(payload?.orbit?.elements)
+      ? payload.orbit.elements.map((entry) => [entry?.name, entry?.value])
+      : []
+  );
+  const physicalParameters = new Map(
+    Array.isArray(payload?.phys_par)
+      ? payload.phys_par.map((entry) => [entry?.name, entry?.value])
+      : []
+  );
+
+  const a = toFiniteNumber(orbitElements.get("a"));
+  const e = toFiniteNumber(orbitElements.get("e"));
+  const i = toFiniteNumber(orbitElements.get("i"));
+  if (!Number.isFinite(a) || !Number.isFinite(e) || !Number.isFinite(i)) {
+    return null;
+  }
+
+  const orbitalPeriodDays = toFiniteNumber(orbitElements.get("per"));
+  return {
+    id: String(object.spkid),
+    name: String(object.fullname).trim(),
+    primaryDesignation: sanitizeConstraintValue(object.pdes ?? object.des),
+    classCode: String(object.orbit_class?.code ?? "Unknown"),
+    zone: classifyBeltZone(a),
+    a,
+    e,
+    i,
+    om: toFiniteNumber(orbitElements.get("om")),
+    w: toFiniteNumber(orbitElements.get("w")),
+    ma: toFiniteNumber(orbitElements.get("ma")),
+    diameterKm: toFiniteNumber(physicalParameters.get("diameter")),
+    albedo: toFiniteNumber(physicalParameters.get("albedo")),
+    absoluteMagnitudeH: toFiniteNumber(physicalParameters.get("H")),
+    epochMjd: null,
+    orbitalPeriodYears: Number.isFinite(orbitalPeriodDays)
+      ? orbitalPeriodDays / 365.25
+      : periodYearsFromSemiMajorAxis(a)
+  };
 }
 
 function normalizeCatalogQuery(searchParams) {
@@ -708,4 +742,24 @@ function clampInt(rawValue, min, max, fallback) {
 function toFiniteNumber(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function periodYearsFromSemiMajorAxis(a) {
+  if (!Number.isFinite(a) || a <= 0) {
+    return null;
+  }
+  return Math.sqrt(a ** 3);
+}
+
+function classifyBeltZone(a) {
+  if (!Number.isFinite(a)) {
+    return "Unknown";
+  }
+  if (a < 2.5) {
+    return "Inner Belt";
+  }
+  if (a < 2.82) {
+    return "Middle Belt";
+  }
+  return "Outer Belt";
 }

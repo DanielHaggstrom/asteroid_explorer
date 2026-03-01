@@ -163,7 +163,7 @@ function attachListeners() {
       return;
     }
 
-    setStatus(`Searching JPL for "${query}"...`);
+    setStatus(`Searching objects for "${query}"...`);
     triggerRemoteSearch(query, requestToken);
   });
 
