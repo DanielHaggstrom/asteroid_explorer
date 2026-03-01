@@ -168,6 +168,11 @@
         <div class="pagination-controls">
           <button id="tablePrevPage" type="button">Prev</button>
           <span id="tablePageIndicator">Page 1 / 1</span>
+          <label class="page-jump" for="tablePageJump">
+            <span>Jump to</span>
+            <input id="tablePageJump" type="number" min="1" step="1" value="1">
+          </label>
+          <button id="tablePageJumpButton" type="button">Go</button>
           <button id="tableNextPage" type="button">Next</button>
         </div>
         <div class="table-wrap">

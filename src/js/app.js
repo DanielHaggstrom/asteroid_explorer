@@ -42,6 +42,8 @@ const elements = {
   tablePrevPage: document.getElementById("tablePrevPage"),
   tableNextPage: document.getElementById("tableNextPage"),
   tablePageIndicator: document.getElementById("tablePageIndicator"),
+  tablePageJump: document.getElementById("tablePageJump"),
+  tablePageJumpButton: document.getElementById("tablePageJumpButton"),
   tableSortButtons: Array.from(document.querySelectorAll(".sort-btn")),
   detailName: document.getElementById("detailName"),
   detailId: document.getElementById("detailId"),
@@ -89,7 +91,9 @@ const state = {
     diameterFilter: "all",
     minDiameterKm: null,
     isLoading: false,
-    error: null
+    error: null,
+    pageCache: new Map(),
+    inFlightCacheKeys: new Set()
   }
 };
 
@@ -106,6 +110,7 @@ bootstrap();
 async function bootstrap() {
   elements.mapDensityValue.textContent = String(state.filters.mapDensity);
   elements.tablePageSize.value = String(state.table.pageSize);
+  elements.tablePageJump.value = String(state.table.page);
   setStatus("Loading prepared startup sample...");
   state.table.isLoading = true;
   renderAll();
@@ -221,6 +226,21 @@ function attachListeners() {
     }
   });
 
+  elements.tablePageJumpButton.addEventListener("click", () => {
+    void jumpToRequestedTablePage();
+  });
+
+  elements.tablePageJump.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      void jumpToRequestedTablePage();
+    }
+  });
+
+  elements.tablePageJump.addEventListener("blur", () => {
+    syncPageJumpControl();
+  });
+
   elements.tableSortButtons.forEach((button) => {
     button.addEventListener("click", () => {
       const sortKey = button.dataset.sortKey;
@@ -309,8 +329,11 @@ function renderTable() {
   elements.asteroidTableBody.replaceChildren(...rowElements);
   elements.tableSummary.textContent = buildTableSummaryText(rows.length);
   elements.tablePageIndicator.textContent = `Page ${formatNumber(state.table.page, 0)} / ${formatNumber(totalPages, 0)}`;
+  syncPageJumpControl(totalPages);
   elements.tablePrevPage.disabled = state.table.isLoading || state.table.page <= 1;
   elements.tableNextPage.disabled = state.table.isLoading || state.table.page >= totalPages;
+  elements.tablePageJump.disabled = state.table.totalCount === 0;
+  elements.tablePageJumpButton.disabled = state.table.isLoading || state.table.totalCount === 0;
   updateSortButtonState();
 }
 
@@ -356,19 +379,22 @@ function appendCell(row, text) {
 
 async function refreshTable() {
   const requestToken = ++state.tableRequestToken;
+  const tableQuery = buildTableQuery(state.table.page);
+  const cached = getCachedTablePage(tableQuery);
+  if (cached) {
+    applyTableResult(cached);
+    renderTable();
+    void prefetchAdjacentTablePages(tableQuery, cached.meta.totalCount);
+    return;
+  }
+
   state.table.isLoading = true;
   state.table.error = null;
   renderTable();
 
   try {
     const result = await loadCatalogPage({
-      page: state.table.page,
-      pageSize: state.table.pageSize,
-      zone: state.filters.zone,
-      diameterFilter: state.table.diameterFilter,
-      minDiameterKm: state.table.minDiameterKm,
-      sortKey: state.table.sortKey,
-      sortDirection: state.table.sortDirection,
+      ...tableQuery,
       timeoutMs: APP_CONFIG.proxyFetchTimeoutMs
     });
 
@@ -376,9 +402,9 @@ async function refreshTable() {
       return;
     }
 
-    state.table.rows = result.asteroids;
-    state.table.totalCount = result.meta.totalCount;
-    state.table.error = null;
+    cacheTablePage(tableQuery, result);
+    applyTableResult(result);
+    void prefetchAdjacentTablePages(tableQuery, result.meta.totalCount);
   } catch (error) {
     if (requestToken !== state.tableRequestToken) {
       return;
@@ -400,6 +426,29 @@ function setSelectedAsteroid(asteroid) {
   integrateSelectedAsteroidIntoSample();
   renderSourceBadge();
   renderAll();
+}
+
+async function jumpToRequestedTablePage() {
+  const totalPages = getTableTotalPages();
+  if (totalPages < 1) {
+    return;
+  }
+
+  const rawValue = elements.tablePageJump.value.trim();
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed)) {
+    syncPageJumpControl(totalPages);
+    return;
+  }
+
+  const nextPage = Math.min(totalPages, Math.max(1, Math.floor(parsed)));
+  if (nextPage === state.table.page) {
+    syncPageJumpControl(totalPages);
+    return;
+  }
+
+  state.table.page = nextPage;
+  await refreshTable();
 }
 
 function integrateSelectedAsteroidIntoSample() {
@@ -593,6 +642,11 @@ function getTableTotalPages() {
   return Math.max(1, Math.ceil(state.table.totalCount / state.table.pageSize));
 }
 
+function syncPageJumpControl(totalPages = getTableTotalPages()) {
+  elements.tablePageJump.max = String(Math.max(1, totalPages));
+  elements.tablePageJump.value = String(Math.min(totalPages, Math.max(1, state.table.page)));
+}
+
 function updateSortButtonState() {
   elements.tableSortButtons.forEach((button) => {
     const isActive = button.dataset.sortKey === state.table.sortKey;
@@ -636,6 +690,74 @@ function dedupeAsteroids(records) {
     }
   }
   return Array.from(byId.values());
+}
+
+function buildTableQuery(page) {
+  return {
+    page,
+    pageSize: state.table.pageSize,
+    zone: state.filters.zone,
+    diameterFilter: state.table.diameterFilter,
+    minDiameterKm: state.table.minDiameterKm,
+    sortKey: state.table.sortKey,
+    sortDirection: state.table.sortDirection
+  };
+}
+
+function getTableCacheKey(query) {
+  return JSON.stringify(query);
+}
+
+function getCachedTablePage(query) {
+  return state.table.pageCache.get(getTableCacheKey(query)) ?? null;
+}
+
+function cacheTablePage(query, result) {
+  const cacheKey = getTableCacheKey(query);
+  state.table.pageCache.delete(cacheKey);
+  state.table.pageCache.set(cacheKey, result);
+
+  while (state.table.pageCache.size > 18) {
+    const oldestKey = state.table.pageCache.keys().next().value;
+    state.table.pageCache.delete(oldestKey);
+  }
+}
+
+function applyTableResult(result) {
+  state.table.rows = result.asteroids;
+  state.table.totalCount = result.meta.totalCount;
+  state.table.error = null;
+  state.table.isLoading = false;
+}
+
+async function prefetchAdjacentTablePages(baseQuery, totalCount) {
+  const totalPages = Math.max(1, Math.ceil(totalCount / baseQuery.pageSize));
+  const adjacentPages = [baseQuery.page - 1, baseQuery.page + 1].filter(
+    (page) => page >= 1 && page <= totalPages
+  );
+
+  for (const page of adjacentPages) {
+    const query = { ...baseQuery, page };
+    const cacheKey = getTableCacheKey(query);
+    if (state.table.pageCache.has(cacheKey) || state.table.inFlightCacheKeys.has(cacheKey)) {
+      continue;
+    }
+
+    state.table.inFlightCacheKeys.add(cacheKey);
+    loadCatalogPage({
+      ...query,
+      timeoutMs: APP_CONFIG.proxyFetchTimeoutMs
+    })
+      .then((result) => {
+        cacheTablePage(query, result);
+      })
+      .catch(() => {
+        // Quiet prefetch: foreground requests surface errors.
+      })
+      .finally(() => {
+        state.table.inFlightCacheKeys.delete(cacheKey);
+      });
+  }
 }
 
 function debounce(fn, delayMs) {

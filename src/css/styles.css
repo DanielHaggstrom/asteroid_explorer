@@ -348,6 +348,7 @@ canvas {
 .pagination-controls {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   margin-bottom: 10px;
 }
@@ -370,6 +371,29 @@ canvas {
 #tablePageIndicator {
   color: var(--muted);
   font-size: 0.9rem;
+}
+
+.page-jump {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 700;
+}
+
+.page-jump input {
+  width: 84px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font: inherit;
+  color: var(--ink);
+  background: #fffdf9;
+  text-transform: none;
+  letter-spacing: normal;
 }
 
 .table-wrap {
