@@ -25,6 +25,3 @@ __pycache__/
 .env
 .env.*
 !.env.example
-
-# Local generated asteroid catalog data
-data/catalog/

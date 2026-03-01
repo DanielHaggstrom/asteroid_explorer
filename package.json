@@ -1,4 +1,4 @@
-{
+﻿{
   "name": "asteroid-explorer",
   "version": "0.1.0",
   "private": true,
@@ -17,7 +17,8 @@
   "scripts": {
     "dev": "node server.mjs",
     "serve": "node server.mjs",
-    "catalog:build": "node scripts/build_catalog.mjs",
+    "sample:update": "node scripts/update_startup_sample.mjs",
+    "sample:update:commit": "node scripts/update_startup_sample.mjs --commit",
     "test": "node tests/utils.test.mjs"
   }
 }

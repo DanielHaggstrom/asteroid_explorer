@@ -1,56 +1,38 @@
-import fs from "node:fs";
-import fsPromises from "node:fs/promises";
+﻿import fsPromises from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
-import readline from "node:readline";
 import { fileURLToPath } from "node:url";
+import {
+  API_FIELDS,
+  OBJECT_API_BASE_URL,
+  buildQueryApiUrl,
+  dedupeAsteroids,
+  fetchJsonWithRetries,
+  mapQueryPayloadToAsteroids,
+  sanitizeConstraintValue,
+  sanitizeSearchFragment,
+  titleCaseWords
+} from "./lib/jpl-api.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT_DIR = __dirname;
 const PORT = Number(process.env.PORT || 4173);
 
-const API_BASE_URL = "https://ssd-api.jpl.nasa.gov/sbdb_query.api";
-const OBJECT_API_BASE_URL = "https://ssd-api.jpl.nasa.gov/sbdb.api";
-const API_FIELDS = [
-  "spkid",
-  "full_name",
-  "pdes",
-  "class",
-  "a",
-  "e",
-  "i",
-  "om",
-  "w",
-  "ma",
-  "diameter",
-  "albedo",
-  "H",
-  "epoch"
-];
+const STARTUP_SAMPLE_PATH = path.join(ROOT_DIR, "data", "main-belt-startup.json");
 
-const CATALOG_DIR = path.join(ROOT_DIR, "data", "catalog");
-const CATALOG_MANIFEST_PATH = path.join(CATALOG_DIR, "manifest.json");
-const STARTUP_SNAPSHOT_PATH = path.join(ROOT_DIR, "data", "main-belt-startup.json");
-
-const SAMPLE_OBJECTS = 20_000;
-const BACKGROUND_UPDATE_SAMPLE = 3_000;
-const BACKGROUND_UPDATE_INTERVAL_MS = 15 * 60 * 1000;
-const OVERLAY_MAX_OBJECTS = 25_000;
-const DEFAULT_OBJECT_COUNT_ESTIMATE = 1_350_000;
+const DEFAULT_STARTUP_SAMPLE_SIZE = 10_000;
+const TABLE_PAGE_SIZE_DEFAULT = 25;
+const TABLE_PAGE_SIZE_MAX = 100;
+const SEARCH_RESULT_LIMIT = 20;
+const SEARCH_QUERY_MAX_LEN = 80;
 const FETCH_TIMEOUT_MS = 45_000;
 const MAX_FETCH_RETRIES = 2;
-const CACHE_TTL_MS = 60 * 60 * 1000;
-const SEARCH_RESULT_LIMIT = 40;
-const SEARCH_QUERY_MAX_LEN = 80;
-
-let cacheEntry = null;
-let localCatalogManifest = null;
-let lastAvailableCountEstimate = DEFAULT_OBJECT_COUNT_ESTIMATE;
-let overlayUpdatesById = new Map();
-let isOverlayRefreshInFlight = false;
-let isLiveCacheRefreshInFlight = false;
-let backgroundTimer = null;
+const QUERY_CACHE_TTL_MS = 10 * 60 * 1000;
+const SAMPLE_REFRESH_DELAY_MS = 45_000;
+const SAMPLE_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
+const SAMPLE_REFRESH_BATCH_SIZE = 20;
+const SAMPLE_REFRESH_OBJECT_COUNT = 100;
 
 const mimeByExt = Object.freeze({
   ".html": "text/html; charset=utf-8",
@@ -64,6 +46,25 @@ const mimeByExt = Object.freeze({
   ".jpg": "image/jpeg",
   ".jpeg": "image/jpeg"
 });
+
+const sampleState = {
+  asteroids: [],
+  meta: {
+    source: "Prepared startup sample",
+    availableCount: null,
+    sampleMode: "prepared-startup-sample",
+    warning: null,
+    coreObjectIds: [],
+    generatedAt: null,
+    lastRefreshedAt: null
+  }
+};
+
+const responseCache = new Map();
+let isSampleInitializationInFlight = false;
+let isSampleRefreshInFlight = false;
+let sampleRefreshCursor = 0;
+let backgroundTimer = null;
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -79,13 +80,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.method === "GET" && requestUrl.pathname === "/api/search") {
-      await handleSearchApi(requestUrl, res);
+    if (req.method === "GET" && requestUrl.pathname === "/api/catalog") {
+      await handleCatalogApi(requestUrl, res);
       return;
     }
 
-    if (req.method === "GET" && requestUrl.pathname === "/api/stats") {
-      await handleStatsApi(res);
+    if (req.method === "GET" && requestUrl.pathname === "/api/search") {
+      await handleSearchApi(requestUrl, res);
       return;
     }
 
@@ -102,282 +103,199 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Asteroid Explorer server running on http://localhost:${PORT}`);
-  void initializeCatalogLayer();
+  void initializeStartupSample();
 });
 
-async function initializeCatalogLayer() {
-  const loaded = await ensureCatalogLayerReady();
-  if (!loaded) {
-    console.log("No local catalog manifest detected. Using direct API sampling mode.");
+async function initializeStartupSample() {
+  if (isSampleInitializationInFlight || sampleState.asteroids.length > 0) {
+    return;
+  }
+
+  isSampleInitializationInFlight = true;
+  try {
+    const payload = await readPreparedStartupSample();
+    if (payload) {
+      hydrateSampleState(payload);
+      startBackgroundSampleRefreshLoop();
+      console.log(`Loaded prepared startup sample with ${sampleState.asteroids.length} objects.`);
+      return;
+    }
+
+    const livePayload = await fetchRandomWindowSample(DEFAULT_STARTUP_SAMPLE_SIZE);
+    livePayload.meta.warning = "Prepared startup sample missing. Serving a live JPL sample.";
+    hydrateSampleState(livePayload);
+    startBackgroundSampleRefreshLoop();
+    console.warn("Prepared startup sample was unavailable. Using a live JPL sample instead.");
+  } catch (error) {
+    console.warn(`Startup sample initialization failed: ${error.message}`);
+  } finally {
+    isSampleInitializationInFlight = false;
   }
 }
 
-async function ensureCatalogLayerReady() {
-  if (localCatalogManifest) {
-    return true;
-  }
+function hydrateSampleState(payload) {
+  const asteroids = dedupeAsteroids(Array.isArray(payload?.asteroids) ? payload.asteroids : []);
+  const meta = payload?.meta ?? {};
 
-  const manifest = await loadLocalCatalogManifest();
-  if (!manifest) {
-    return false;
-  }
-
-  localCatalogManifest = manifest;
-  console.log(
-    `Loaded local catalog manifest: ${localCatalogManifest.totalCount} objects, ` +
-      `${localCatalogManifest.chunkFiles.length} chunks.`
-  );
-  startBackgroundOverlayRefreshLoop();
-  return true;
+  sampleState.asteroids = asteroids;
+  sampleState.meta = {
+    source: meta.source ?? "Prepared startup sample",
+    availableCount: toFiniteNumber(meta.availableCount),
+    sampleMode: meta.sampleMode ?? "prepared-startup-sample",
+    warning: meta.warning ?? null,
+    coreObjectIds: Array.isArray(meta.coreObjectIds) ? meta.coreObjectIds.map(String) : [],
+    generatedAt: meta.generatedAt ?? meta.fetchedAt ?? null,
+    lastRefreshedAt: meta.lastRefreshedAt ?? null
+  };
 }
 
-function startBackgroundOverlayRefreshLoop() {
+function buildSamplePayload() {
+  return {
+    meta: {
+      source: sampleState.meta.source,
+      fetchedAt: new Date().toISOString(),
+      generatedAt: sampleState.meta.generatedAt,
+      lastRefreshedAt: sampleState.meta.lastRefreshedAt,
+      loadedCount: sampleState.asteroids.length,
+      availableCount: sampleState.meta.availableCount,
+      sampleMode: sampleState.meta.sampleMode,
+      warning: sampleState.meta.warning,
+      coreObjectIds: sampleState.meta.coreObjectIds
+    },
+    asteroids: sampleState.asteroids
+  };
+}
+
+function startBackgroundSampleRefreshLoop() {
   if (backgroundTimer) {
     clearInterval(backgroundTimer);
   }
+
   setTimeout(() => {
-    void refreshOverlayFromApi();
-  }, 7_000);
+    void refreshLoadedSampleInMemory();
+  }, SAMPLE_REFRESH_DELAY_MS);
 
   backgroundTimer = setInterval(() => {
-    void refreshOverlayFromApi();
-  }, BACKGROUND_UPDATE_INTERVAL_MS);
+    void refreshLoadedSampleInMemory();
+  }, SAMPLE_REFRESH_INTERVAL_MS);
 }
 
-async function refreshOverlayFromApi() {
-  if (isOverlayRefreshInFlight) {
+async function refreshLoadedSampleInMemory() {
+  if (isSampleRefreshInFlight || sampleState.asteroids.length === 0) {
     return;
   }
-  isOverlayRefreshInFlight = true;
 
+  isSampleRefreshInFlight = true;
   try {
-    const payload = await fetchMainBeltFromJpl(BACKGROUND_UPDATE_SAMPLE);
-    upsertOverlay(payload.asteroids);
-    cacheEntry = null;
+    const refreshTargets = getNextRefreshTargets(sampleState.asteroids, SAMPLE_REFRESH_OBJECT_COUNT);
+    const refreshed = [];
+    for (const chunk of chunkArray(refreshTargets, SAMPLE_REFRESH_BATCH_SIZE)) {
+      const rows = await fetchAsteroidsByIdentifiers(
+        chunk.map((asteroid) => asteroid.id),
+        "spkid"
+      );
+      refreshed.push(...rows);
+    }
+
+    if (!refreshed.length) {
+      return;
+    }
+
+    const refreshedById = new Map(refreshed.map((asteroid) => [asteroid.id, asteroid]));
+    sampleState.asteroids = sampleState.asteroids.map((asteroid) => refreshedById.get(asteroid.id) ?? asteroid);
+    sampleState.meta.lastRefreshedAt = new Date().toISOString();
+    sampleState.meta.source = "Prepared startup sample + live JPL refresh";
   } catch (error) {
-    console.warn(`Background overlay refresh failed: ${error.message}`);
+    console.warn(`Background sample refresh failed: ${error.message}`);
   } finally {
-    isOverlayRefreshInFlight = false;
+    isSampleRefreshInFlight = false;
   }
 }
 
-function upsertOverlay(records) {
-  for (const record of records) {
-    if (!record?.id) {
-      continue;
-    }
-    if (overlayUpdatesById.has(record.id)) {
-      overlayUpdatesById.delete(record.id);
-    }
-    overlayUpdatesById.set(record.id, record);
-    while (overlayUpdatesById.size > OVERLAY_MAX_OBJECTS) {
-      const oldestKey = overlayUpdatesById.keys().next().value;
-      overlayUpdatesById.delete(oldestKey);
-    }
+function getNextRefreshTargets(asteroids, count) {
+  if (asteroids.length <= count) {
+    return asteroids.slice();
   }
+
+  const output = [];
+  for (let index = 0; index < count; index += 1) {
+    output.push(asteroids[(sampleRefreshCursor + index) % asteroids.length]);
+  }
+  sampleRefreshCursor = (sampleRefreshCursor + count) % asteroids.length;
+  return output;
 }
 
 async function handleMainBeltApi(res) {
-  await ensureCatalogLayerReady();
-  const now = Date.now();
-  if (cacheEntry && now - cacheEntry.cachedAt < CACHE_TTL_MS) {
-    sendJson(res, 200, cacheEntry.payload, {
+  await ensureStartupSampleReady();
+  if (sampleState.asteroids.length === 0) {
+    sendJson(res, 502, {
+      error: "Failed to load asteroid data.",
+      detail: "No prepared startup sample or live fallback is available."
+    });
+    return;
+  }
+
+  sendJson(res, 200, buildSamplePayload(), {
+    "Cache-Control": "public, max-age=60"
+  });
+}
+
+async function handleCatalogApi(requestUrl, res) {
+  const query = normalizeCatalogQuery(requestUrl.searchParams);
+  const cacheKey = `catalog:${JSON.stringify(query)}`;
+  const cached = getCachedPayload(cacheKey);
+  if (cached) {
+    sendJson(res, 200, cached, {
       "Cache-Control": "public, max-age=60"
     });
     return;
   }
 
-  if (!localCatalogManifest) {
-    const startupSnapshot = await readStartupSnapshot();
-    if (startupSnapshot) {
-      cacheEntry = { cachedAt: now, payload: startupSnapshot };
-      void refreshLiveCacheFromJpl();
-      sendJson(res, 200, startupSnapshot, {
-        "Cache-Control": "public, max-age=60"
-      });
-      return;
-    }
-  }
-
   try {
-    const payload = localCatalogManifest
-      ? await fetchMainBeltFromLocalCatalog()
-      : await fetchMainBeltFromJpl(SAMPLE_OBJECTS);
-
-    cacheEntry = { cachedAt: now, payload };
+    const payload = await fetchCatalogPage(query);
+    setCachedPayload(cacheKey, payload);
     sendJson(res, 200, payload, {
       "Cache-Control": "public, max-age=60"
     });
   } catch (error) {
-    try {
-      const fallback = await readFallbackDataset();
-      fallback.meta = {
-        ...fallback.meta,
-        source: `${fallback.meta?.source || "local-fallback"} (upstream unavailable)`,
-        warning: "Live JPL API unavailable. Serving fallback snapshot."
-      };
-      sendJson(res, 200, fallback, {
-        "Cache-Control": "no-store"
-      });
-    } catch {
-      sendJson(res, 502, {
-        error: "Failed to load asteroid data.",
-        detail: error.message
-      });
-    }
+    sendJson(res, 502, {
+      error: "Failed to load catalog page.",
+      detail: error.message
+    });
   }
-}
-
-async function refreshLiveCacheFromJpl() {
-  if (isLiveCacheRefreshInFlight || localCatalogManifest) {
-    return;
-  }
-
-  isLiveCacheRefreshInFlight = true;
-  try {
-    const payload = await fetchMainBeltFromJpl(SAMPLE_OBJECTS);
-    cacheEntry = {
-      cachedAt: Date.now(),
-      payload
-    };
-  } catch (error) {
-    console.warn(`Live cache refresh failed: ${error.message}`);
-  } finally {
-    isLiveCacheRefreshInFlight = false;
-  }
-}
-
-async function fetchMainBeltFromLocalCatalog() {
-  if (!localCatalogManifest || !Array.isArray(localCatalogManifest.chunkFiles) || !localCatalogManifest.chunkFiles.length) {
-    throw new Error("Local catalog manifest is unavailable.");
-  }
-
-  const chunkFile = localCatalogManifest.chunkFiles[randomIntInclusive(0, localCatalogManifest.chunkFiles.length - 1)];
-  const chunkPath = path.join(CATALOG_DIR, "chunks", chunkFile);
-  const chunkPayload = JSON.parse(await fsPromises.readFile(chunkPath, "utf8"));
-  const chunkObjects = Array.isArray(chunkPayload.asteroids) ? chunkPayload.asteroids : [];
-  if (!chunkObjects.length) {
-    throw new Error(`Selected catalog chunk is empty: ${chunkFile}`);
-  }
-
-  const overlayObjects = Array.from(overlayUpdatesById.values());
-  const merged = dedupeById([...chunkObjects, ...overlayObjects]);
-  const sampled = merged.length > SAMPLE_OBJECTS ? randomSampleArray(merged, SAMPLE_OBJECTS) : merged;
-
-  return {
-    meta: {
-      source: "Local catalog snapshot + live API overlay",
-      fetchedAt: new Date().toISOString(),
-      loadedCount: sampled.length,
-      availableCount: Number(localCatalogManifest.totalCount) || null,
-      sampleMode: "local-chunk",
-      sampleChunk: chunkFile,
-      overlayCount: overlayObjects.length,
-      catalogGeneratedAt: localCatalogManifest.generatedAt
-    },
-    asteroids: sampled
-  };
-}
-
-async function fetchMainBeltFromJpl(sampleSize) {
-  const initialMaxOffset = Math.max(0, lastAvailableCountEstimate - sampleSize);
-  let sampleOffset = randomIntInclusive(0, initialMaxOffset);
-  let payload = await fetchJsonWithRetries(buildJplRequestUrl(sampleSize, sampleOffset), FETCH_TIMEOUT_MS, MAX_FETCH_RETRIES);
-
-  let fields = Array.isArray(payload.fields) ? payload.fields : [];
-  let rows = Array.isArray(payload.data) ? payload.data : [];
-  let fieldIndex = createFieldIndex(fields);
-  let availableCount = Number.isFinite(Number(payload.count)) ? Number(payload.count) : null;
-
-  if (Number.isFinite(availableCount)) {
-    lastAvailableCountEstimate = availableCount;
-  }
-
-  if (!rows.length && Number.isFinite(availableCount) && sampleOffset > 0) {
-    sampleOffset = Math.max(0, availableCount - sampleSize);
-    payload = await fetchJsonWithRetries(buildJplRequestUrl(sampleSize, sampleOffset), FETCH_TIMEOUT_MS, MAX_FETCH_RETRIES);
-    fields = Array.isArray(payload.fields) ? payload.fields : [];
-    rows = Array.isArray(payload.data) ? payload.data : [];
-    fieldIndex = createFieldIndex(fields);
-    availableCount = Number.isFinite(Number(payload.count)) ? Number(payload.count) : availableCount;
-    if (Number.isFinite(availableCount)) {
-      lastAvailableCountEstimate = availableCount;
-    }
-  }
-
-  const asteroids = dedupeById(rows.map((row) => mapRowToAsteroid(row, fieldIndex)).filter(Boolean));
-  return {
-    meta: {
-      source: "NASA/JPL SBDB Query API",
-      fetchedAt: new Date().toISOString(),
-      loadedCount: asteroids.length,
-      availableCount,
-      sampleMode: "random-window-api",
-      sampleOffset
-    },
-    asteroids
-  };
-}
-
-function buildJplRequestUrl(limit, offset) {
-  const params = new URLSearchParams({
-    fields: API_FIELDS.join(","),
-    "sb-kind": "a",
-    "sb-class": "MBA",
-    "full-prec": "1",
-    limit: String(limit),
-    "limit-from": String(offset)
-  });
-  return `${API_BASE_URL}?${params.toString()}`;
 }
 
 async function handleSearchApi(requestUrl, res) {
-  await ensureCatalogLayerReady();
-  const rawQuery = (requestUrl.searchParams.get("q") ?? "").trim();
-  const query = rawQuery.slice(0, SEARCH_QUERY_MAX_LEN);
-  const limit = clampInt(requestUrl.searchParams.get("limit"), 1, SEARCH_RESULT_LIMIT, 20);
+  const query = (requestUrl.searchParams.get("q") ?? "").trim().slice(0, SEARCH_QUERY_MAX_LEN);
+  const limit = clampInt(requestUrl.searchParams.get("limit"), 1, SEARCH_RESULT_LIMIT, 8);
 
   if (!query) {
     sendJson(res, 200, {
-      meta: { source: "Local/API search", query, loadedCount: 0, availableCount: null },
+      meta: {
+        source: "NASA/JPL SBDB APIs",
+        query,
+        loadedCount: 0,
+        availableCount: null
+      },
       asteroids: []
+    }, {
+      "Cache-Control": "no-store"
+    });
+    return;
+  }
+
+  const cacheKey = `search:${query.toLowerCase()}:${limit}`;
+  const cached = getCachedPayload(cacheKey);
+  if (cached) {
+    sendJson(res, 200, cached, {
+      "Cache-Control": "no-store"
     });
     return;
   }
 
   try {
-    const localMatches = await searchLocalCatalog(query, limit);
-    if (localMatches.length > 0) {
-      sendJson(res, 200, {
-        meta: {
-          source: "Local catalog search index",
-          query,
-          loadedCount: localMatches.length,
-          availableCount: null
-        },
-        asteroids: localMatches
-      }, {
-        "Cache-Control": "no-store"
-      });
-      return;
-    }
-
-    const pdesValues = await resolveQueryToPdes(query, limit);
-    if (!pdesValues.length) {
-      sendJson(res, 200, {
-        meta: { source: "NASA/JPL SBDB Search API", query, loadedCount: 0, availableCount: null },
-        asteroids: []
-      });
-      return;
-    }
-
-    const payload = await fetchAsteroidsByPdes(pdesValues);
-    payload.meta = {
-      ...payload.meta,
-      source: "NASA/JPL SBDB Query API (search fallback)",
-      query
-    };
-    upsertOverlay(payload.asteroids);
+    const payload = await searchAsteroids(query, limit);
+    setCachedPayload(cacheKey, payload);
     sendJson(res, 200, payload, {
       "Cache-Control": "no-store"
     });
@@ -389,109 +307,88 @@ async function handleSearchApi(requestUrl, res) {
   }
 }
 
-async function searchLocalCatalog(query, limit) {
-  if (!localCatalogManifest) {
-    return [];
-  }
+async function fetchCatalogPage(query) {
+  const clauses = buildCatalogClauses(query);
+  const sort = buildCatalogSort(query.sortKey, query.sortDirection);
+  const offset = Math.max(0, (query.page - 1) * query.pageSize);
 
-  const searchIndexFile = localCatalogManifest.searchIndexFile || "search-index.ndjson";
-  const searchIndexPath = path.join(CATALOG_DIR, searchIndexFile);
-  if (!(await fileExists(searchIndexPath))) {
-    return [];
-  }
-
-  const queryLower = query.toLowerCase();
-  const matches = [];
-
-  const stream = fs.createReadStream(searchIndexPath, { encoding: "utf8" });
-  const reader = readline.createInterface({
-    input: stream,
-    crlfDelay: Infinity
+  const url = buildQueryApiUrl({
+    fields: API_FIELDS,
+    limit: query.pageSize,
+    offset,
+    sort,
+    clauses,
+    clauseMode: "AND"
   });
 
-  try {
-    for await (const line of reader) {
-      if (!line) {
-        continue;
-      }
-      let record;
-      try {
-        record = JSON.parse(line);
-      } catch {
-        continue;
-      }
+  const payload = await fetchJsonWithRetries(url, {
+    timeoutMs: FETCH_TIMEOUT_MS,
+    maxRetries: MAX_FETCH_RETRIES
+  });
 
-      if (matchesQuery(record, queryLower)) {
-        matches.push(record);
-      }
-      if (matches.length >= limit) {
-        break;
-      }
-    }
-  } finally {
-    reader.close();
-    stream.destroy();
-  }
+  const asteroids = mapQueryPayloadToAsteroids(payload);
+  const totalCount = toFiniteNumber(payload?.count) ?? asteroids.length;
 
-  if (!matches.length) {
-    return [];
-  }
-  return loadLocalCatalogMatches(matches);
+  return {
+    meta: {
+      source: "NASA/JPL SBDB Query API",
+      fetchedAt: new Date().toISOString(),
+      page: query.page,
+      pageSize: query.pageSize,
+      totalCount,
+      sortKey: query.sortKey,
+      sortDirection: query.sortDirection,
+      zone: query.zone,
+      diameterFilter: query.diameterFilter,
+      minDiameterKm: query.minDiameterKm
+    },
+    asteroids
+  };
 }
 
-function matchesQuery(record, queryLower) {
-  const id = String(record.id ?? "").toLowerCase();
-  const nameLower = String(record.nameLower ?? "");
-  const pdesLower = String(record.pdesLower ?? "");
-  return id.includes(queryLower) || nameLower.includes(queryLower) || pdesLower.includes(queryLower);
-}
+async function searchAsteroids(rawQuery, limit) {
+  const exactPdes = await resolveExactPdesMatches(rawQuery, limit).catch(() => []);
+  const exactMatches = exactPdes.length > 0 ? await fetchAsteroidsByIdentifiers(exactPdes, "pdes") : [];
 
-async function loadLocalCatalogMatches(matches) {
-  const grouped = new Map();
-  for (const match of matches) {
-    if (!match.chunk || !Number.isFinite(match.row)) {
-      continue;
-    }
-    if (!grouped.has(match.chunk)) {
-      grouped.set(match.chunk, []);
-    }
-    grouped.get(match.chunk).push(match.row);
+  const broadClauses = buildSearchClauses(rawQuery);
+  let broadMatches = [];
+  if (broadClauses.length > 0) {
+    broadMatches = await fetchAsteroidsByClauses(broadClauses, {
+      limit: Math.min(SEARCH_RESULT_LIMIT, limit * 2),
+      clauseMode: "OR",
+      sort: "-diameter"
+    });
   }
 
-  const outputById = new Map();
-  for (const [chunkFile, rowIndexes] of grouped.entries()) {
-    const chunkPath = path.join(CATALOG_DIR, "chunks", chunkFile);
-    if (!(await fileExists(chunkPath))) {
-      continue;
-    }
-    const chunkPayload = JSON.parse(await fsPromises.readFile(chunkPath, "utf8"));
-    const rows = Array.isArray(chunkPayload.asteroids) ? chunkPayload.asteroids : [];
-    for (const rowIndex of rowIndexes) {
-      const row = rows[rowIndex];
-      if (row?.id) {
-        outputById.set(row.id, row);
-      }
-    }
-  }
-
-  return Array.from(outputById.values());
+  const asteroids = dedupeAsteroids([...exactMatches, ...broadMatches]).slice(0, limit);
+  return {
+    meta: {
+      source: "NASA/JPL SBDB APIs",
+      fetchedAt: new Date().toISOString(),
+      query: rawQuery,
+      loadedCount: asteroids.length,
+      availableCount: null
+    },
+    asteroids
+  };
 }
 
-async function resolveQueryToPdes(query, limit) {
+async function resolveExactPdesMatches(query, limit) {
   const url = `${OBJECT_API_BASE_URL}?${new URLSearchParams({ sstr: query }).toString()}`;
-  const payload = await fetchJsonWithRetries(url, FETCH_TIMEOUT_MS, MAX_FETCH_RETRIES);
-  const output = new Set();
+  const payload = await fetchJsonWithRetries(url, {
+    timeoutMs: FETCH_TIMEOUT_MS,
+    maxRetries: MAX_FETCH_RETRIES
+  });
 
-  if (payload?.object) {
-    const candidate = sanitizeConstraintValue(payload.object.pdes ?? payload.object.des);
-    if (candidate) {
-      output.add(candidate);
-    }
+  const output = new Set();
+  const directCandidate = sanitizeConstraintValue(payload?.object?.pdes ?? payload?.object?.des);
+  if (directCandidate) {
+    output.add(directCandidate);
   }
 
   if (Array.isArray(payload?.list)) {
     for (const item of payload.list) {
-      const candidate = sanitizeConstraintValue(item?.pdes);
+      const candidate = sanitizeConstraintValue(item?.pdes ?? item?.des);
       if (candidate) {
         output.add(candidate);
       }
@@ -504,262 +401,223 @@ async function resolveQueryToPdes(query, limit) {
   return Array.from(output).slice(0, limit);
 }
 
-async function fetchAsteroidsByPdes(pdesValues) {
-  const safePdes = pdesValues
-    .map((value) => sanitizeConstraintValue(value))
-    .filter(Boolean)
-    .slice(0, SEARCH_RESULT_LIMIT);
-
-  if (!safePdes.length) {
-    return {
-      meta: {
-        fetchedAt: new Date().toISOString(),
-        loadedCount: 0,
-        availableCount: null
-      },
-      asteroids: []
-    };
-  }
-
-  const cdata = JSON.stringify({ OR: safePdes.map((value) => `pdes|EQ|${value}`) });
-  const params = new URLSearchParams({
-    fields: API_FIELDS.join(","),
-    "sb-kind": "a",
-    "sb-class": "MBA",
-    "full-prec": "1",
-    "sb-cdata": cdata,
-    limit: String(safePdes.length)
+async function fetchRandomWindowSample(targetSize) {
+  const initialLimit = Math.max(1, Math.min(targetSize, DEFAULT_STARTUP_SAMPLE_SIZE));
+  const initialUrl = buildQueryApiUrl({
+    fields: API_FIELDS,
+    limit: 1
   });
-  const payload = await fetchJsonWithRetries(`${API_BASE_URL}?${params.toString()}`, FETCH_TIMEOUT_MS, MAX_FETCH_RETRIES);
+  const initialPayload = await fetchJsonWithRetries(initialUrl, {
+    timeoutMs: FETCH_TIMEOUT_MS,
+    maxRetries: MAX_FETCH_RETRIES
+  });
+  const availableCount = Math.max(initialLimit, toFiniteNumber(initialPayload?.count) ?? initialLimit);
+  const maxOffset = Math.max(0, availableCount - initialLimit);
+  const offset = randomIntInclusive(0, maxOffset);
 
-  const fields = Array.isArray(payload.fields) ? payload.fields : [];
-  const rows = Array.isArray(payload.data) ? payload.data : [];
-  const fieldIndex = createFieldIndex(fields);
-  const asteroids = dedupeById(rows.map((row) => mapRowToAsteroid(row, fieldIndex)).filter(Boolean));
+  const payload = await fetchJsonWithRetries(
+    buildQueryApiUrl({
+      fields: API_FIELDS,
+      limit: initialLimit,
+      offset
+    }),
+    {
+      timeoutMs: FETCH_TIMEOUT_MS,
+      maxRetries: MAX_FETCH_RETRIES
+    }
+  );
 
+  const asteroids = mapQueryPayloadToAsteroids(payload);
   return {
     meta: {
+      source: "NASA/JPL SBDB Query API",
       fetchedAt: new Date().toISOString(),
       loadedCount: asteroids.length,
-      availableCount: null
+      availableCount,
+      sampleMode: "live-random-window",
+      warning: null,
+      coreObjectIds: []
     },
     asteroids
   };
 }
 
-async function handleStatsApi(res) {
-  await ensureCatalogLayerReady();
-  if (!localCatalogManifest) {
-    sendJson(res, 404, { error: "No local precomputed stats available." });
-    return;
+async function fetchAsteroidsByIdentifiers(values, fieldName) {
+  const clauses = values
+    .map((value) => sanitizeConstraintValue(value))
+    .filter(Boolean)
+    .map((value) => `${fieldName}|EQ|${value}`);
+
+  if (!clauses.length) {
+    return [];
   }
 
-  const statsFile = localCatalogManifest.statsFile || "precomputed-stats.json";
-  const statsPath = path.join(CATALOG_DIR, statsFile);
-  if (!(await fileExists(statsPath))) {
-    sendJson(res, 404, { error: "Precomputed stats file not found." });
-    return;
-  }
-
-  const statsPayload = JSON.parse(await fsPromises.readFile(statsPath, "utf8"));
-  sendJson(res, 200, statsPayload, {
-    "Cache-Control": "public, max-age=300"
+  return fetchAsteroidsByClauses(clauses, {
+    limit: clauses.length,
+    clauseMode: "OR"
   });
 }
 
-async function fetchJsonWithTimeout(url, timeoutMs) {
-  const controller = new AbortController();
-  const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const response = await fetch(url, {
-      method: "GET",
-      headers: { Accept: "application/json" },
-      signal: controller.signal
-    });
-
-    if (!response.ok) {
-      throw new Error(`Upstream request failed with status ${response.status}`);
-    }
-    return response.json();
-  } finally {
-    clearTimeout(timeoutHandle);
-  }
-}
-
-async function fetchJsonWithRetries(url, timeoutMs, maxRetries) {
-  let lastError = null;
-  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-    try {
-      return await fetchJsonWithTimeout(url, timeoutMs);
-    } catch (error) {
-      lastError = error;
-      if (attempt >= maxRetries) {
-        break;
-      }
-      await sleep(500 * (attempt + 1));
-    }
-  }
-  throw lastError ?? new Error("Unknown fetch failure.");
-}
-
-function createFieldIndex(fields) {
-  const output = {};
-  fields.forEach((field, index) => {
-    output[field] = index;
+async function fetchAsteroidsByClauses(clauses, options = {}) {
+  const url = buildQueryApiUrl({
+    fields: API_FIELDS,
+    limit: options.limit ?? clauses.length,
+    sort: options.sort,
+    clauses,
+    clauseMode: options.clauseMode ?? "OR"
   });
-  return output;
+
+  const payload = await fetchJsonWithRetries(url, {
+    timeoutMs: FETCH_TIMEOUT_MS,
+    maxRetries: MAX_FETCH_RETRIES
+  });
+
+  return mapQueryPayloadToAsteroids(payload);
 }
 
-function mapRowToAsteroid(row, fieldIndex) {
-  const id = pickField(row, fieldIndex, "spkid");
-  const name = pickField(row, fieldIndex, "full_name");
-  const a = toNumber(pickField(row, fieldIndex, "a"));
-  const e = toNumber(pickField(row, fieldIndex, "e"));
-  const i = toNumber(pickField(row, fieldIndex, "i"));
+function buildCatalogClauses(query) {
+  const clauses = [];
 
-  if (!id || !name || !Number.isFinite(a) || !Number.isFinite(e) || !Number.isFinite(i)) {
-    return null;
+  if (query.zone === "Inner Belt") {
+    clauses.push("a|LT|2.5");
+  } else if (query.zone === "Middle Belt") {
+    clauses.push("a|GE|2.5", "a|LT|2.82");
+  } else if (query.zone === "Outer Belt") {
+    clauses.push("a|GE|2.82");
   }
 
+  if (query.diameterFilter === "known") {
+    clauses.push("diameter|DF");
+  } else if (query.diameterFilter === "unknown") {
+    clauses.push("diameter|ND");
+  }
+
+  if (Number.isFinite(query.minDiameterKm)) {
+    clauses.push(`diameter|GE|${query.minDiameterKm}`);
+  }
+
+  return clauses;
+}
+
+function buildCatalogSort(sortKey, sortDirection) {
+  const sortFieldByKey = {
+    name: "full_name",
+    zone: "a",
+    a: "a",
+    e: "e",
+    i: "i",
+    diameterKm: "diameter"
+  };
+
+  const sortField = sortFieldByKey[sortKey] ?? "full_name";
+  return `${sortDirection === "desc" ? "-" : ""}${sortField}`;
+}
+
+function buildSearchClauses(rawQuery) {
+  const sanitized = sanitizeSearchFragment(rawQuery);
+  if (!sanitized || sanitized.length < 2) {
+    return /^\d+$/.test(rawQuery.trim()) ? [`pdes|EQ|${rawQuery.trim()}`] : [];
+  }
+
+  if (/^\d+$/.test(sanitized)) {
+    return [`pdes|EQ|${sanitized}`, `spkid|EQ|${sanitized}`];
+  }
+
+  const clauses = [];
+  const variants = new Set([
+    sanitized,
+    titleCaseWords(sanitized),
+    sanitized.toUpperCase()
+  ]);
+
+  for (const variant of variants) {
+    clauses.push(`full_name|RE|${variant}`);
+    clauses.push(`pdes|RE|${variant}`);
+  }
+
+  return clauses;
+}
+
+function normalizeCatalogQuery(searchParams) {
   return {
-    id: String(id),
-    name: String(name).trim(),
-    primaryDesignation: sanitizeText(pickField(row, fieldIndex, "pdes")),
-    classCode: String(pickField(row, fieldIndex, "class") ?? "Unknown"),
-    zone: classifyBeltZone(a),
-    a,
-    e,
-    i,
-    om: toNumber(pickField(row, fieldIndex, "om")),
-    w: toNumber(pickField(row, fieldIndex, "w")),
-    ma: toNumber(pickField(row, fieldIndex, "ma")),
-    diameterKm: toNumber(pickField(row, fieldIndex, "diameter")),
-    albedo: toNumber(pickField(row, fieldIndex, "albedo")),
-    absoluteMagnitudeH: toNumber(pickField(row, fieldIndex, "H")),
-    epochMjd: toNumber(pickField(row, fieldIndex, "epoch")),
-    orbitalPeriodYears: periodYearsFromSemiMajorAxis(a)
+    page: clampInt(searchParams.get("page"), 1, 100_000, 1),
+    pageSize: clampInt(searchParams.get("pageSize"), 1, TABLE_PAGE_SIZE_MAX, TABLE_PAGE_SIZE_DEFAULT),
+    zone: normalizeZone(searchParams.get("zone")),
+    diameterFilter: normalizeDiameterFilter(searchParams.get("diameterFilter")),
+    minDiameterKm: parseNullableNonNegativeNumber(searchParams.get("minDiameterKm")),
+    sortKey: normalizeSortKey(searchParams.get("sortKey")),
+    sortDirection: normalizeSortDirection(searchParams.get("sortDirection"))
   };
 }
 
-function pickField(row, fieldIndex, name) {
-  const index = fieldIndex[name];
-  if (index === undefined || !Array.isArray(row)) {
+function normalizeZone(rawValue) {
+  if (rawValue === "Inner Belt" || rawValue === "Middle Belt" || rawValue === "Outer Belt") {
+    return rawValue;
+  }
+  return "all";
+}
+
+function normalizeDiameterFilter(rawValue) {
+  if (rawValue === "known" || rawValue === "unknown") {
+    return rawValue;
+  }
+  return "all";
+}
+
+function normalizeSortKey(rawValue) {
+  const allowed = new Set(["name", "zone", "a", "e", "i", "diameterKm"]);
+  return allowed.has(rawValue) ? rawValue : "name";
+}
+
+function normalizeSortDirection(rawValue) {
+  return rawValue === "desc" ? "desc" : "asc";
+}
+
+function parseNullableNonNegativeNumber(rawValue) {
+  const parsed = Number(rawValue);
+  if (!Number.isFinite(parsed) || parsed < 0) {
     return null;
   }
-  return row[index];
+  return parsed;
 }
 
-function toNumber(value) {
-  if (value === null || value === undefined || value === "") {
+async function ensureStartupSampleReady() {
+  if (sampleState.asteroids.length > 0) {
+    return;
+  }
+
+  await initializeStartupSample();
+}
+
+function getCachedPayload(cacheKey) {
+  const entry = responseCache.get(cacheKey);
+  if (!entry) {
     return null;
   }
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function sanitizeText(value) {
-  if (value === null || value === undefined) {
+  if (entry.expiresAt <= Date.now()) {
+    responseCache.delete(cacheKey);
     return null;
   }
-  const cleaned = String(value).trim();
-  return cleaned || null;
+  return entry.payload;
 }
 
-function periodYearsFromSemiMajorAxis(a) {
-  if (!Number.isFinite(a) || a <= 0) {
-    return null;
-  }
-  return Math.sqrt(a ** 3);
+function setCachedPayload(cacheKey, payload) {
+  responseCache.set(cacheKey, {
+    payload,
+    expiresAt: Date.now() + QUERY_CACHE_TTL_MS
+  });
 }
 
-function classifyBeltZone(a) {
-  if (!Number.isFinite(a)) {
-    return "Unknown";
-  }
-  if (a < 2.5) {
-    return "Inner Belt";
-  }
-  if (a < 2.82) {
-    return "Middle Belt";
-  }
-  return "Outer Belt";
-}
-
-function dedupeById(records) {
-  const byId = new Map();
-  for (const record of records) {
-    byId.set(record.id, record);
-  }
-  return Array.from(byId.values());
-}
-
-function randomSampleArray(items, targetSize) {
-  if (items.length <= targetSize) {
-    return items;
-  }
-  const step = items.length / targetSize;
-  const output = [];
-  for (let index = 0; index < targetSize; index += 1) {
-    output.push(items[Math.floor(index * step)]);
-  }
-  return output;
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function readFallbackDataset() {
-  const fallbackPath = path.join(ROOT_DIR, "data", "main-belt-fallback.json");
-  return JSON.parse(await fsPromises.readFile(fallbackPath, "utf8"));
-}
-
-async function readStartupSnapshot() {
-  if (!(await fileExists(STARTUP_SNAPSHOT_PATH))) {
-    return null;
-  }
-
+async function readPreparedStartupSample() {
   try {
-    const payload = JSON.parse(await fsPromises.readFile(STARTUP_SNAPSHOT_PATH, "utf8"));
-    return {
-      ...payload,
-      meta: {
-        ...payload.meta,
-        source: payload.meta?.source || "Bundled startup snapshot",
-        sampleMode: payload.meta?.sampleMode || "bundled-startup-snapshot",
-        fetchedAt: payload.meta?.fetchedAt || new Date().toISOString(),
-        warning: payload.meta?.warning ?? null
-      }
-    };
-  } catch (error) {
-    console.warn(`Failed to read startup snapshot: ${error.message}`);
-    return null;
-  }
-}
-
-async function loadLocalCatalogManifest() {
-  if (!(await fileExists(CATALOG_MANIFEST_PATH))) {
-    return null;
-  }
-
-  try {
-    const manifest = JSON.parse(await fsPromises.readFile(CATALOG_MANIFEST_PATH, "utf8"));
-    if (!Array.isArray(manifest.chunkFiles) || !manifest.chunkFiles.length) {
+    const file = await fsPromises.readFile(STARTUP_SAMPLE_PATH, "utf8");
+    const payload = JSON.parse(file);
+    if (!Array.isArray(payload?.asteroids) || payload.asteroids.length === 0) {
       return null;
     }
-    return manifest;
-  } catch (error) {
-    console.warn(`Failed to parse catalog manifest: ${error.message}`);
-    return null;
-  }
-}
-
-async function fileExists(filePath) {
-  try {
-    await fsPromises.access(filePath);
-    return true;
+    return payload;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -831,6 +689,14 @@ function randomIntInclusive(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
+function chunkArray(items, chunkSize) {
+  const output = [];
+  for (let index = 0; index < items.length; index += chunkSize) {
+    output.push(items.slice(index, index + chunkSize));
+  }
+  return output;
+}
+
 function clampInt(rawValue, min, max, fallback) {
   const parsed = Number(rawValue);
   if (!Number.isFinite(parsed)) {
@@ -839,10 +705,7 @@ function clampInt(rawValue, min, max, fallback) {
   return Math.min(max, Math.max(min, Math.floor(parsed)));
 }
 
-function sanitizeConstraintValue(value) {
-  if (value === null || value === undefined) {
-    return null;
-  }
-  const cleaned = String(value).replace(/[|"]/g, "").trim();
-  return cleaned || null;
+function toFiniteNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }

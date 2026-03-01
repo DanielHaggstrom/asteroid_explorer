@@ -1,0 +1,62 @@
+[
+  {
+    "pdes": "1",
+    "name": "Ceres",
+    "reason": "Largest main-belt body and the first asteroid discovered."
+  },
+  {
+    "pdes": "2",
+    "name": "Pallas",
+    "reason": "One of the largest main-belt asteroids and an early discovery."
+  },
+  {
+    "pdes": "3",
+    "name": "Juno",
+    "reason": "Among the first four discovered main-belt asteroids."
+  },
+  {
+    "pdes": "4",
+    "name": "Vesta",
+    "reason": "Bright, differentiated, and central to belt science and missions."
+  },
+  {
+    "pdes": "10",
+    "name": "Hygiea",
+    "reason": "One of the largest carbonaceous bodies in the belt."
+  },
+  {
+    "pdes": "15",
+    "name": "Eunomia",
+    "reason": "One of the largest stony asteroids and family-forming bodies."
+  },
+  {
+    "pdes": "16",
+    "name": "Psyche",
+    "reason": "Metal-rich asteroid and target of NASA's Psyche mission."
+  },
+  {
+    "pdes": "21",
+    "name": "Lutetia",
+    "reason": "Visited by ESA's Rosetta mission."
+  },
+  {
+    "pdes": "31",
+    "name": "Euphrosyne",
+    "reason": "Large outer-belt object with a distinct high-inclination family."
+  },
+  {
+    "pdes": "52",
+    "name": "Europa",
+    "reason": "Major C-type asteroid in the outer main belt."
+  },
+  {
+    "pdes": "511",
+    "name": "Davida",
+    "reason": "One of the most massive main-belt asteroids."
+  },
+  {
+    "pdes": "704",
+    "name": "Interamnia",
+    "reason": "Large outer-belt object that anchors the upper size distribution."
+  }
+]
