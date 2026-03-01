@@ -1,26 +1,76 @@
-import { APP_CONFIG } from "./config.js";
+﻿import { APP_CONFIG } from "./config.js";
 import { classifyBeltZone, periodYearsFromSemiMajorAxis, toNumber } from "./utils.js";
 
 export async function loadMainBeltAsteroids(options = {}) {
-  const proxyTimeoutMs = options.proxyTimeoutMs ?? APP_CONFIG.proxyFetchTimeoutMs;
-  const upstreamSignal = options.signal;
-
-  try {
-    const proxyPayload = await fetchJsonWithTimeout(APP_CONFIG.proxyApiUrl, proxyTimeoutMs, upstreamSignal);
-    const normalized = normalizeStandardizedPayload(proxyPayload);
-    if (normalized.asteroids.length) {
-      return normalized;
-    }
-    throw new Error("Proxy returned no asteroid objects.");
-  } catch (error) {
-    throw new Error(
-      `Failed to load from local proxy (${APP_CONFIG.proxyApiUrl}). ` +
-        `Run the app with "npm run dev". Details: ${error.message}`
-    );
-  }
+  const payload = await fetchStandardizedPayload(
+    APP_CONFIG.mainBeltApiUrl,
+    options.proxyTimeoutMs ?? APP_CONFIG.proxyFetchTimeoutMs,
+    options.signal
+  );
+  return normalizeAsteroidPayload(payload, {
+    errorPrefix: `Failed to load from local proxy (${APP_CONFIG.mainBeltApiUrl}). Run the app with "npm run dev".`
+  });
 }
 
-async function fetchJsonWithTimeout(url, timeoutMs, upstreamSignal) {
+export async function loadCatalogPage(options = {}) {
+  const params = new URLSearchParams({
+    page: String(options.page ?? 1),
+    pageSize: String(options.pageSize ?? APP_CONFIG.tablePageSizeDefault),
+    zone: options.zone ?? "all",
+    diameterFilter: options.diameterFilter ?? "all",
+    sortKey: options.sortKey ?? "name",
+    sortDirection: options.sortDirection ?? "asc"
+  });
+
+  if (Number.isFinite(options.minDiameterKm)) {
+    params.set("minDiameterKm", String(options.minDiameterKm));
+  }
+
+  const url = `${APP_CONFIG.catalogApiUrl}?${params.toString()}`;
+  const payload = await fetchStandardizedPayload(
+    url,
+    options.timeoutMs ?? APP_CONFIG.proxyFetchTimeoutMs,
+    options.signal
+  );
+
+  const normalized = normalizeAsteroidPayload(payload, {
+    errorPrefix: `Failed to load catalog page from ${APP_CONFIG.catalogApiUrl}.`
+  });
+
+  return {
+    ...normalized,
+    meta: {
+      ...normalized.meta,
+      page: toNumber(payload?.meta?.page) ?? 1,
+      pageSize: toNumber(payload?.meta?.pageSize) ?? APP_CONFIG.tablePageSizeDefault,
+      totalCount: toNumber(payload?.meta?.totalCount) ?? normalized.asteroids.length,
+      sortKey: payload?.meta?.sortKey ?? "name",
+      sortDirection: payload?.meta?.sortDirection ?? "asc",
+      zone: payload?.meta?.zone ?? "all",
+      diameterFilter: payload?.meta?.diameterFilter ?? "all",
+      minDiameterKm: toNumber(payload?.meta?.minDiameterKm)
+    }
+  };
+}
+
+export async function searchAsteroids(query, options = {}) {
+  const params = new URLSearchParams({
+    q: query,
+    limit: String(options.limit ?? APP_CONFIG.searchLimitDefault)
+  });
+
+  const payload = await fetchStandardizedPayload(
+    `${APP_CONFIG.searchApiUrl}?${params.toString()}`,
+    options.timeoutMs ?? APP_CONFIG.proxyFetchTimeoutMs,
+    options.signal
+  );
+
+  return normalizeAsteroidPayload(payload, {
+    errorPrefix: `Search request failed against ${APP_CONFIG.searchApiUrl}.`
+  });
+}
+
+async function fetchStandardizedPayload(url, timeoutMs, upstreamSignal) {
   const controller = new AbortController();
   const timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -53,32 +103,29 @@ async function fetchJsonWithTimeout(url, timeoutMs, upstreamSignal) {
   }
 }
 
-function dedupeById(records) {
-  const byId = new Map();
-  for (const record of records) {
-    byId.set(record.id, record);
-  }
-  return Array.from(byId.values());
-}
-
-function normalizeStandardizedPayload(payload) {
+function normalizeAsteroidPayload(payload, options = {}) {
   const records = Array.isArray(payload?.asteroids) ? payload.asteroids : [];
-  const asteroids = records.map(normalizeStandardizedAsteroid).filter(Boolean);
-  const deduped = dedupeById(asteroids);
+  const asteroids = dedupeById(records.map(normalizeAsteroid).filter(Boolean));
 
   return {
-    asteroids: deduped,
+    asteroids,
     meta: {
       source: payload?.meta?.source ?? "Unknown source",
       fetchedAt: payload?.meta?.fetchedAt ?? new Date().toISOString(),
       availableCount: toNumber(payload?.meta?.availableCount),
-      loadedCount: deduped.length,
-      warning: payload?.meta?.warning ?? null
+      loadedCount: asteroids.length,
+      warning: payload?.meta?.warning ?? null,
+      generatedAt: payload?.meta?.generatedAt ?? null,
+      lastRefreshedAt: payload?.meta?.lastRefreshedAt ?? null,
+      sampleMode: payload?.meta?.sampleMode ?? null,
+      coreObjectIds: Array.isArray(payload?.meta?.coreObjectIds)
+        ? payload.meta.coreObjectIds.map(String)
+        : []
     }
   };
 }
 
-function normalizeStandardizedAsteroid(item) {
+function normalizeAsteroid(item) {
   if (!item || typeof item !== "object") {
     return null;
   }
@@ -94,8 +141,8 @@ function normalizeStandardizedAsteroid(item) {
 
   return {
     id: String(id),
-    name: String(name),
-    primaryDesignation: item.primaryDesignation ? String(item.primaryDesignation) : null,
+    name: String(name).trim(),
+    primaryDesignation: item.primaryDesignation ? String(item.primaryDesignation).trim() : null,
     classCode: String(item.classCode ?? "Unknown"),
     zone: item.zone ?? classifyBeltZone(a),
     a,
@@ -110,4 +157,12 @@ function normalizeStandardizedAsteroid(item) {
     epochMjd: toNumber(item.epochMjd),
     orbitalPeriodYears: toNumber(item.orbitalPeriodYears) ?? periodYearsFromSemiMajorAxis(a)
   };
+}
+
+function dedupeById(records) {
+  const byId = new Map();
+  for (const record of records) {
+    byId.set(record.id, record);
+  }
+  return Array.from(byId.values());
 }

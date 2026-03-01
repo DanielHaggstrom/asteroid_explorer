@@ -1,5 +1,5 @@
-import { APP_CONFIG } from "./config.js";
-import { loadMainBeltAsteroids } from "./dataService.js";
+﻿import { APP_CONFIG } from "./config.js";
+import { loadCatalogPage, loadMainBeltAsteroids, searchAsteroids } from "./dataService.js";
 import {
   drawBarChart,
   drawBeltMap,
@@ -57,34 +57,39 @@ const elements = {
   detailEpoch: document.getElementById("detailEpoch")
 };
 
-const REMOTE_SEARCH_MIN_QUERY_LENGTH = 2;
-const REMOTE_SEARCH_LIMIT = 25;
 let visualizationResizeObserver = null;
 
 const state = {
-  allAsteroids: [],
-  zoneFilteredAsteroids: [],
-  filteredAsteroids: [],
-  selectedId: null,
+  sampleAsteroids: [],
+  displayAsteroids: [],
   mapPoints: [],
+  selectedAsteroid: null,
   searchRequestToken: 0,
+  tableRequestToken: 0,
   meta: {
     source: "Unknown source",
     availableCount: null,
-    warning: null
+    warning: null,
+    generatedAt: null,
+    lastRefreshedAt: null,
+    sampleMode: null,
+    coreObjectIds: []
   },
   filters: {
-    query: "",
     zone: "all",
     mapDensity: APP_CONFIG.maxMapPointsDefault
   },
   table: {
+    rows: [],
+    totalCount: 0,
+    page: 1,
+    pageSize: APP_CONFIG.tablePageSizeDefault,
+    sortKey: "name",
+    sortDirection: "asc",
     diameterFilter: "all",
     minDiameterKm: null,
-    pageSize: APP_CONFIG.tablePageSizeDefault,
-    page: 1,
-    sortKey: "name",
-    sortDirection: "asc"
+    isLoading: false,
+    error: null
   }
 };
 
@@ -99,59 +104,74 @@ attachListeners();
 bootstrap();
 
 async function bootstrap() {
-  setStatus("Loading official JPL asteroid data...");
+  elements.mapDensityValue.textContent = String(state.filters.mapDensity);
+  elements.tablePageSize.value = String(state.table.pageSize);
+  setStatus("Loading prepared startup sample...");
+  state.table.isLoading = true;
+  renderAll();
 
   try {
     const result = await loadMainBeltAsteroids({
       proxyTimeoutMs: APP_CONFIG.proxyFetchTimeoutMs
     });
 
-    state.allAsteroids = result.asteroids;
+    state.sampleAsteroids = result.asteroids;
     state.meta = {
       source: result.meta.source,
       availableCount: result.meta.availableCount,
-      warning: result.meta.warning
+      warning: result.meta.warning,
+      generatedAt: result.meta.generatedAt,
+      lastRefreshedAt: result.meta.lastRefreshedAt,
+      sampleMode: result.meta.sampleMode,
+      coreObjectIds: result.meta.coreObjectIds
     };
-    state.selectedId = result.asteroids[0]?.id ?? null;
+    reconcileDisplayAsteroids();
     renderSourceBadge();
+    renderAll();
     if (result.meta.warning) {
       setStatus(result.meta.warning, "warning");
     } else {
-      setStatus("Data loaded.");
+      setStatus("Prepared sample loaded. Full-catalog browsing uses the live JPL API.");
     }
-    applyFiltersAndRender();
     requestAnimationFrame(() => renderVisualizations());
+    void refreshTable();
   } catch (error) {
     elements.sourceBadge.textContent = "Source: unavailable";
-    setStatus(`Failed to load data: ${error.message}`, true);
-    state.allAsteroids = [];
-    state.meta = {
-      source: "Unavailable",
-      availableCount: null,
-      warning: null
-    };
-    state.zoneFilteredAsteroids = [];
-    state.filteredAsteroids = [];
-    state.selectedId = null;
+    state.sampleAsteroids = [];
+    state.displayAsteroids = [];
+    state.selectedAsteroid = null;
+    state.table.isLoading = false;
+    state.table.error = null;
     renderAll();
+    setStatus(`Failed to load data: ${error.message}`, "error");
   }
 }
 
 function attachListeners() {
   elements.searchInput.addEventListener("input", (event) => {
-    state.filters.query = event.target.value.trim().toLowerCase();
+    const query = event.target.value.trim();
     const requestToken = ++state.searchRequestToken;
-    state.table.page = 1;
-    applyFiltersAndRender();
-    if (state.filters.query.length >= REMOTE_SEARCH_MIN_QUERY_LENGTH) {
-      triggerRemoteSearch(state.filters.query, requestToken);
+    const isNumericLookup = /^\d+$/.test(query);
+
+    if (!query) {
+      restoreDefaultStatus();
+      return;
     }
+
+    if (query.length < APP_CONFIG.searchMinQueryLength && !isNumericLookup) {
+      setStatus(`Type at least ${APP_CONFIG.searchMinQueryLength} characters to search.`, "warning");
+      return;
+    }
+
+    setStatus(`Searching JPL for "${query}"...`);
+    triggerRemoteSearch(query, requestToken);
   });
 
   elements.zoneSelect.addEventListener("change", (event) => {
     state.filters.zone = event.target.value;
     state.table.page = 1;
-    applyFiltersAndRender();
+    renderAll();
+    void refreshTable();
   });
 
   elements.mapDensityRange.addEventListener("input", (event) => {
@@ -164,7 +184,7 @@ function attachListeners() {
   elements.tableDiameterFilter.addEventListener("change", (event) => {
     state.table.diameterFilter = event.target.value;
     state.table.page = 1;
-    renderTable();
+    void refreshTable();
   });
 
   elements.tableMinDiameter.addEventListener("input", (event) => {
@@ -176,20 +196,20 @@ function attachListeners() {
       state.table.minDiameterKm = Number.isFinite(value) && value >= 0 ? value : null;
     }
     state.table.page = 1;
-    renderTable();
+    void refreshTable();
   });
 
   elements.tablePageSize.addEventListener("change", (event) => {
     const value = Number(event.target.value);
     state.table.pageSize = Number.isFinite(value) && value > 0 ? value : APP_CONFIG.tablePageSizeDefault;
     state.table.page = 1;
-    renderTable();
+    void refreshTable();
   });
 
   elements.tablePrevPage.addEventListener("click", () => {
     if (state.table.page > 1) {
       state.table.page -= 1;
-      renderTable();
+      void refreshTable();
     }
   });
 
@@ -197,7 +217,7 @@ function attachListeners() {
     const totalPages = getTableTotalPages();
     if (state.table.page < totalPages) {
       state.table.page += 1;
-      renderTable();
+      void refreshTable();
     }
   });
 
@@ -215,7 +235,7 @@ function attachListeners() {
         state.table.sortDirection = "asc";
       }
       state.table.page = 1;
-      renderTable();
+      void refreshTable();
     });
   });
 
@@ -228,43 +248,16 @@ function attachListeners() {
       return;
     }
 
-    state.selectedId = nearest.id;
-    renderDetails();
-    renderTable();
-    renderVisualizations();
+    const asteroid = findAsteroidById(nearest.id);
+    if (!asteroid) {
+      return;
+    }
+
+    setSelectedAsteroid(asteroid);
   });
 
   attachVisualizationResizeObserver();
   window.addEventListener("resize", triggerVisualizationRerender);
-}
-
-function applyFiltersAndRender() {
-  state.zoneFilteredAsteroids = state.allAsteroids.filter(
-    (asteroid) => state.filters.zone === "all" || asteroid.zone === state.filters.zone
-  );
-
-  if (state.filters.query) {
-    state.filteredAsteroids = state.allAsteroids.filter((asteroid) =>
-      matchesSearchQuery(asteroid, state.filters.query)
-    );
-  } else {
-    state.filteredAsteroids = state.zoneFilteredAsteroids;
-  }
-
-  if (state.filters.query) {
-    if (state.filteredAsteroids.length > 0) {
-      const selectedStillVisible = state.filteredAsteroids.some((item) => item.id === state.selectedId);
-      if (!selectedStillVisible) {
-        state.selectedId = state.filteredAsteroids[0]?.id ?? null;
-      }
-    } else if (!state.zoneFilteredAsteroids.some((item) => item.id === state.selectedId)) {
-      state.selectedId = state.zoneFilteredAsteroids[0]?.id ?? null;
-    }
-  } else if (!state.zoneFilteredAsteroids.some((item) => item.id === state.selectedId)) {
-    state.selectedId = state.zoneFilteredAsteroids[0]?.id ?? null;
-  }
-
-  renderAll();
 }
 
 function renderAll() {
@@ -275,99 +268,75 @@ function renderAll() {
 }
 
 function renderKpis() {
-  const records = state.zoneFilteredAsteroids;
-  const loadedCount = state.allAsteroids.length;
-  const availableCount = state.meta.availableCount;
-  const total = records.length;
+  const records = getVisualizationAsteroids();
+  const loadedCount = state.displayAsteroids.length;
   const withDiameter = records.filter((item) => Number.isFinite(item.diameterKm));
   const meanDiameter = average(withDiameter.map((item) => item.diameterKm));
   const meanEccentricity = average(records.map((item) => item.e));
 
   elements.kpiTotal.textContent = formatNumber(loadedCount, 0);
-  elements.kpiTotalMeta.textContent = Number.isFinite(availableCount) && availableCount > 0
-    ? `of ${formatNumber(availableCount, 0)} cataloged`
-    : "sample currently loaded";
-  elements.kpiDiameterCoverage.textContent = `${formatNumber(withDiameter.length, 0)} / ${formatNumber(total, 0)}`;
+  elements.kpiTotalMeta.textContent = Number.isFinite(state.meta.availableCount) && state.meta.availableCount > 0
+    ? `of ${formatNumber(state.meta.availableCount, 0)} cataloged`
+    : "prepared sample loaded";
+  elements.kpiDiameterCoverage.textContent = `${formatNumber(withDiameter.length, 0)} / ${formatNumber(records.length, 0)}`;
   elements.kpiMeanDiameter.textContent = formatWithUnit(meanDiameter, "km", 2);
   elements.kpiMeanEccentricity.textContent = formatNumber(meanEccentricity, 4);
   elements.kpiDominantZone.textContent = dominantZone(records);
 }
 
 function renderVisualizations() {
-  drawBarChart(elements.sizeChart, computeSizeBuckets(state.zoneFilteredAsteroids, { includeUnknown: false }));
-  drawScatterPlot(elements.orbitScatterChart, state.zoneFilteredAsteroids);
-  drawSemiMajorAxisHistogram(elements.semiMajorAxisChart, state.zoneFilteredAsteroids);
-  drawTrueAnomalyHistogram(elements.trueAnomalyChart, state.zoneFilteredAsteroids);
+  const records = getVisualizationAsteroids();
+  drawBarChart(elements.sizeChart, computeSizeBuckets(records, { includeUnknown: false }));
+  drawScatterPlot(elements.orbitScatterChart, records);
+  drawSemiMajorAxisHistogram(elements.semiMajorAxisChart, records);
+  drawTrueAnomalyHistogram(elements.trueAnomalyChart, records);
   state.mapPoints = drawBeltMap(
     elements.beltMap,
-    state.zoneFilteredAsteroids,
-    state.selectedId,
+    records,
+    state.selectedAsteroid?.id ?? null,
     state.filters.mapDensity
   );
 }
 
-function attachVisualizationResizeObserver() {
-  if (typeof ResizeObserver === "undefined") {
-    return;
-  }
-
-  visualizationResizeObserver?.disconnect();
-  visualizationResizeObserver = new ResizeObserver(() => {
-    triggerVisualizationRerender();
-  });
-
-  [
-    elements.sizeChart,
-    elements.orbitScatterChart,
-    elements.semiMajorAxisChart,
-    elements.trueAnomalyChart,
-    elements.beltMap
-  ].forEach((element) => {
-    if (element) {
-      visualizationResizeObserver.observe(element);
-    }
-  });
-}
-
 function renderTable() {
-  const sortedRows = getTableRows();
-  const pageSize = state.table.pageSize;
-  const totalPages = Math.max(1, Math.ceil(sortedRows.length / pageSize));
+  const rows = state.table.rows;
+  const totalPages = getTableTotalPages();
   if (state.table.page > totalPages) {
     state.table.page = totalPages;
   }
-  const pageStartIndex = (state.table.page - 1) * pageSize;
-  const pageRows = sortedRows.slice(pageStartIndex, pageStartIndex + pageSize);
 
-  const rowElements = pageRows.map((asteroid) => createRow(asteroid));
+  const rowElements = rows.map((asteroid) => createRow(asteroid));
   elements.asteroidTableBody.replaceChildren(...rowElements);
-
-  const pageEndIndex = pageStartIndex + pageRows.length;
-  const rangeLabel = sortedRows.length
-    ? `${formatNumber(pageStartIndex + 1, 0)}-${formatNumber(pageEndIndex, 0)}`
-    : "0-0";
-  elements.tableSummary.textContent =
-    `Rows ${rangeLabel} of ${formatNumber(sortedRows.length, 0)} table matches ` +
-    `(${formatNumber(state.zoneFilteredAsteroids.length, 0)} zone-filtered, ` +
-    `${formatNumber(state.filteredAsteroids.length, 0)} search-matched, ` +
-    `${formatNumber(state.allAsteroids.length, 0)} loaded).`;
-
+  elements.tableSummary.textContent = buildTableSummaryText(rows.length);
   elements.tablePageIndicator.textContent = `Page ${formatNumber(state.table.page, 0)} / ${formatNumber(totalPages, 0)}`;
-  elements.tablePrevPage.disabled = state.table.page <= 1;
-  elements.tableNextPage.disabled = state.table.page >= totalPages;
+  elements.tablePrevPage.disabled = state.table.isLoading || state.table.page <= 1;
+  elements.tableNextPage.disabled = state.table.isLoading || state.table.page >= totalPages;
   updateSortButtonState();
+}
+
+function buildTableSummaryText(rowCount) {
+  if (state.table.isLoading) {
+    return "Loading catalog page from the JPL API...";
+  }
+  if (state.table.error) {
+    return `Catalog page unavailable: ${state.table.error}`;
+  }
+  if (state.table.totalCount === 0) {
+    return "No catalog rows match the current filters.";
+  }
+
+  const pageStartIndex = (state.table.page - 1) * state.table.pageSize;
+  const pageEndIndex = pageStartIndex + rowCount;
+  return `Rows ${formatNumber(pageStartIndex + 1, 0)}-${formatNumber(pageEndIndex, 0)} of ${formatNumber(state.table.totalCount, 0)} matching the current filters.`;
 }
 
 function createRow(asteroid) {
   const row = document.createElement("tr");
-  if (asteroid.id === state.selectedId) {
+  if (asteroid.id === state.selectedAsteroid?.id) {
     row.classList.add("selected");
   }
   row.addEventListener("click", () => {
-    state.selectedId = asteroid.id;
-    renderDetails();
-    renderTable();
-    renderVisualizations();
+    setSelectedAsteroid(asteroid);
   });
 
   appendCell(row, asteroid.name);
@@ -385,61 +354,137 @@ function appendCell(row, text) {
   row.appendChild(cell);
 }
 
-function getTableRows() {
-  const baseRows = state.filters.query ? state.filteredAsteroids : state.zoneFilteredAsteroids;
-  const filtered = baseRows.filter((asteroid) => {
-    if (state.table.diameterFilter === "known" && !Number.isFinite(asteroid.diameterKm)) {
-      return false;
-    }
-    if (state.table.diameterFilter === "unknown" && Number.isFinite(asteroid.diameterKm)) {
-      return false;
-    }
-    if (Number.isFinite(state.table.minDiameterKm) && (!Number.isFinite(asteroid.diameterKm) || asteroid.diameterKm < state.table.minDiameterKm)) {
-      return false;
-    }
-    return true;
-  });
+async function refreshTable() {
+  const requestToken = ++state.tableRequestToken;
+  state.table.isLoading = true;
+  state.table.error = null;
+  renderTable();
 
-  const direction = state.table.sortDirection === "desc" ? -1 : 1;
-  const sortKey = state.table.sortKey;
-  return filtered.slice().sort((left, right) => compareBySortKey(left, right, sortKey) * direction);
+  try {
+    const result = await loadCatalogPage({
+      page: state.table.page,
+      pageSize: state.table.pageSize,
+      zone: state.filters.zone,
+      diameterFilter: state.table.diameterFilter,
+      minDiameterKm: state.table.minDiameterKm,
+      sortKey: state.table.sortKey,
+      sortDirection: state.table.sortDirection,
+      timeoutMs: APP_CONFIG.proxyFetchTimeoutMs
+    });
+
+    if (requestToken !== state.tableRequestToken) {
+      return;
+    }
+
+    state.table.rows = result.asteroids;
+    state.table.totalCount = result.meta.totalCount;
+    state.table.error = null;
+  } catch (error) {
+    if (requestToken !== state.tableRequestToken) {
+      return;
+    }
+    state.table.rows = [];
+    state.table.totalCount = 0;
+    state.table.error = error.message;
+  } finally {
+    if (requestToken !== state.tableRequestToken) {
+      return;
+    }
+    state.table.isLoading = false;
+    renderTable();
+  }
 }
 
-function compareBySortKey(left, right, sortKey) {
-  const leftValue = left[sortKey];
-  const rightValue = right[sortKey];
+function setSelectedAsteroid(asteroid) {
+  state.selectedAsteroid = asteroid ? { ...asteroid } : null;
+  integrateSelectedAsteroidIntoSample();
+  renderSourceBadge();
+  renderAll();
+}
 
-  if (sortKey === "name" || sortKey === "zone") {
-    return String(leftValue ?? "").localeCompare(String(rightValue ?? ""));
+function integrateSelectedAsteroidIntoSample() {
+  const selected = state.selectedAsteroid;
+  if (!selected?.id) {
+    reconcileDisplayAsteroids();
+    return;
   }
 
-  const safeLeft = Number.isFinite(leftValue) ? leftValue : Number.NEGATIVE_INFINITY;
-  const safeRight = Number.isFinite(rightValue) ? rightValue : Number.NEGATIVE_INFINITY;
-  return safeLeft - safeRight;
+  const sampleIndex = state.sampleAsteroids.findIndex((item) => item.id === selected.id);
+  if (sampleIndex >= 0) {
+    const nextSample = state.sampleAsteroids.slice();
+    nextSample[sampleIndex] = selected;
+    state.sampleAsteroids = nextSample;
+  }
+
+  reconcileDisplayAsteroids();
 }
 
-function getTableTotalPages() {
-  const totalRows = getTableRows().length;
-  return Math.max(1, Math.ceil(totalRows / state.table.pageSize));
+function reconcileDisplayAsteroids() {
+  const selected = state.selectedAsteroid;
+  const nextDisplay = state.sampleAsteroids.slice();
+  const sampleSize = nextDisplay.length;
+
+  if (selected?.id) {
+    const existingIndex = nextDisplay.findIndex((item) => item.id === selected.id);
+    if (existingIndex >= 0) {
+      nextDisplay[existingIndex] = selected;
+    } else if (sampleSize === 0) {
+      nextDisplay.push(selected);
+    } else {
+      const evictionIndex = pickEvictionIndex(nextDisplay, new Set(state.meta.coreObjectIds), selected.id);
+      if (evictionIndex >= 0) {
+        nextDisplay.splice(evictionIndex, 1);
+      }
+      nextDisplay.push(selected);
+      while (nextDisplay.length > sampleSize) {
+        nextDisplay.shift();
+      }
+    }
+  }
+
+  state.displayAsteroids = dedupeAsteroids(nextDisplay);
 }
 
-function updateSortButtonState() {
-  elements.tableSortButtons.forEach((button) => {
-    const isActive = button.dataset.sortKey === state.table.sortKey;
-    const baseLabel = button.dataset.baseLabel ?? button.textContent.trim();
-    button.dataset.baseLabel = baseLabel;
-    button.classList.toggle("active", isActive);
-    button.textContent = isActive
-      ? `${baseLabel} ${state.table.sortDirection === "asc" ? "^" : "v"}`
-      : baseLabel;
-  });
+function pickEvictionIndex(sampleAsteroids, coreObjectIds, protectedId) {
+  const candidates = [];
+  for (let index = 0; index < sampleAsteroids.length; index += 1) {
+    const asteroid = sampleAsteroids[index];
+    if (asteroid.id !== protectedId && !coreObjectIds.has(asteroid.id)) {
+      candidates.push(index);
+    }
+  }
+
+  if (candidates.length === 0) {
+    return sampleAsteroids.length > 0 ? sampleAsteroids.length - 1 : -1;
+  }
+
+  return candidates[Math.floor(Math.random() * candidates.length)];
+}
+
+function getVisualizationAsteroids() {
+  const filtered = state.displayAsteroids.filter(
+    (asteroid) => state.filters.zone === "all" || asteroid.zone === state.filters.zone
+  );
+
+  if (state.selectedAsteroid && !filtered.some((asteroid) => asteroid.id === state.selectedAsteroid.id)) {
+    return [...filtered, state.selectedAsteroid];
+  }
+  return filtered;
+}
+
+function findAsteroidById(id) {
+  return (
+    state.displayAsteroids.find((item) => item.id === id) ??
+    state.table.rows.find((item) => item.id === id) ??
+    (state.selectedAsteroid?.id === id ? state.selectedAsteroid : null)
+  );
 }
 
 function renderDetails() {
-  const selected = state.allAsteroids.find((item) => item.id === state.selectedId);
+  const selected = state.selectedAsteroid;
   if (!selected) {
     setDetailValues({
-      detailName: "No selection",
+      detailName: "No body selected",
       detailId: "-",
       detailClass: "-",
       detailZone: "-",
@@ -479,63 +524,118 @@ function setDetailValues(values) {
 
 function setStatus(message, type = "info") {
   elements.statusMessage.textContent = message;
-  const normalizedType = type === true ? "error" : type;
-  elements.statusMessage.classList.toggle("is-error", normalizedType === "error");
-  elements.statusMessage.classList.toggle("is-warning", normalizedType === "warning");
+  elements.statusMessage.classList.toggle("is-error", type === "error");
+  elements.statusMessage.classList.toggle("is-warning", type === "warning");
+}
+
+function restoreDefaultStatus() {
+  if (state.meta.warning) {
+    setStatus(state.meta.warning, "warning");
+    return;
+  }
+
+  if (state.sampleAsteroids.length > 0) {
+    setStatus("Prepared sample loaded. Full-catalog browsing uses the live JPL API.");
+    return;
+  }
+
+  setStatus("Loading asteroid data...");
 }
 
 async function fetchRemoteSearch(query, requestToken) {
-  if (requestToken !== state.searchRequestToken || query !== state.filters.query) {
+  if (requestToken !== state.searchRequestToken) {
     return;
   }
 
   try {
-    const params = new URLSearchParams({
-      q: query,
-      limit: String(REMOTE_SEARCH_LIMIT)
+    const result = await searchAsteroids(query, {
+      limit: APP_CONFIG.searchLimitDefault,
+      timeoutMs: APP_CONFIG.proxyFetchTimeoutMs
     });
-    const response = await fetch(`/api/search?${params.toString()}`, {
-      headers: { Accept: "application/json" }
-    });
-    if (!response.ok) {
-      throw new Error(`search status ${response.status}`);
-    }
 
-    const payload = await response.json();
-    if (requestToken !== state.searchRequestToken || query !== state.filters.query) {
+    if (requestToken !== state.searchRequestToken) {
       return;
     }
 
-    const remoteAsteroids = Array.isArray(payload.asteroids) ? payload.asteroids : [];
-    if (remoteAsteroids.length > 0) {
-      state.allAsteroids = mergeAsteroids(state.allAsteroids, remoteAsteroids);
-      renderSourceBadge();
-      applyFiltersAndRender();
+    const matches = result.asteroids;
+    if (matches.length === 0) {
+      setStatus(`No matching asteroid found for "${query}".`, "warning");
+      return;
+    }
+
+    setSelectedAsteroid(matches[0]);
+    if (matches.length === 1) {
+      setStatus(`Selected ${matches[0].name} from the live JPL search.`);
+    } else {
+      setStatus(`Selected ${matches[0].name}; ${formatNumber(matches.length, 0)} matches returned by the live JPL search.`);
     }
   } catch (error) {
-    if (requestToken !== state.searchRequestToken || query !== state.filters.query) {
+    if (requestToken !== state.searchRequestToken) {
       return;
     }
     setStatus(`Search endpoint warning: ${error.message}`, "warning");
   }
 }
 
-function mergeAsteroids(baseAsteroids, incomingAsteroids) {
-  const mergedById = new Map(baseAsteroids.map((item) => [item.id, item]));
-  for (const asteroid of incomingAsteroids) {
-    if (asteroid && asteroid.id) {
-      mergedById.set(asteroid.id, asteroid);
-    }
-  }
-  return Array.from(mergedById.values());
+function renderSourceBadge() {
+  elements.sourceBadge.textContent = buildSourceBadgeText();
 }
 
-function matchesSearchQuery(asteroid, query) {
-  const target = [asteroid.name, asteroid.id, asteroid.primaryDesignation]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-  return target.includes(query);
+function buildSourceBadgeText() {
+  const loaded = formatNumber(state.displayAsteroids.length || state.sampleAsteroids.length, 0);
+  if (Number.isFinite(state.meta.availableCount) && state.meta.availableCount > 0) {
+    return `Source: ${state.meta.source} (${loaded} / ${formatNumber(state.meta.availableCount, 0)} loaded)`;
+  }
+  return `Source: ${state.meta.source} (${loaded} loaded)`;
+}
+
+function getTableTotalPages() {
+  return Math.max(1, Math.ceil(state.table.totalCount / state.table.pageSize));
+}
+
+function updateSortButtonState() {
+  elements.tableSortButtons.forEach((button) => {
+    const isActive = button.dataset.sortKey === state.table.sortKey;
+    const baseLabel = button.dataset.baseLabel ?? button.textContent.trim();
+    button.dataset.baseLabel = baseLabel;
+    button.classList.toggle("active", isActive);
+    button.textContent = isActive
+      ? `${baseLabel} ${state.table.sortDirection === "asc" ? "^" : "v"}`
+      : baseLabel;
+  });
+}
+
+function attachVisualizationResizeObserver() {
+  if (typeof ResizeObserver === "undefined") {
+    return;
+  }
+
+  visualizationResizeObserver?.disconnect();
+  visualizationResizeObserver = new ResizeObserver(() => {
+    triggerVisualizationRerender();
+  });
+
+  [
+    elements.sizeChart,
+    elements.orbitScatterChart,
+    elements.semiMajorAxisChart,
+    elements.trueAnomalyChart,
+    elements.beltMap
+  ].forEach((element) => {
+    if (element) {
+      visualizationResizeObserver.observe(element);
+    }
+  });
+}
+
+function dedupeAsteroids(records) {
+  const byId = new Map();
+  for (const record of records) {
+    if (record?.id) {
+      byId.set(record.id, record);
+    }
+  }
+  return Array.from(byId.values());
 }
 
 function debounce(fn, delayMs) {
@@ -547,17 +647,3 @@ function debounce(fn, delayMs) {
     timeoutHandle = setTimeout(() => fn(...args), delayMs);
   };
 }
-
-function buildSourceBadgeText(meta) {
-  const loaded = formatNumber(state.allAsteroids.length || meta.loadedCount, 0);
-  if (Number.isFinite(meta.availableCount) && meta.availableCount > 0) {
-    const available = formatNumber(meta.availableCount, 0);
-    return `Source: ${meta.source} (${loaded} / ${available} loaded)`;
-  }
-  return `Source: ${meta.source} (${loaded} loaded)`;
-}
-
-function renderSourceBadge() {
-  elements.sourceBadge.textContent = buildSourceBadgeText(state.meta);
-}
-

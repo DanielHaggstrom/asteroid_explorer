@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
   <head>
     <meta charset="UTF-8">
@@ -106,13 +106,13 @@
             </div>
           </div>
           <canvas id="beltMap" aria-label="Top-down asteroid belt map"></canvas>
-          <p class="hint">Click a point to inspect an asteroid.</p>
+          <p class="hint">Click a point or search/select a table row to pin an object into the live sample.</p>
         </article>
 
         <article class="panel details-card reveal delay-7">
           <div class="details-search">
             <label for="searchInput">Search Object</label>
-            <input id="searchInput" type="search" placeholder="Name or SPK-ID" autocomplete="off">
+            <input id="searchInput" type="search" placeholder="Name, designation, or SPK-ID" autocomplete="off">
           </div>
           <h2>Selected Object</h2>
           <dl class="details-grid">
@@ -145,7 +145,7 @@
       </section>
 
       <section class="panel table-card reveal delay-7">
-        <h2>Objects</h2>
+        <h2>Full Catalog Browser</h2>
         <div class="table-toolbar">
           <label for="tableDiameterFilter">Diameter Data</label>
           <select id="tableDiameterFilter">
@@ -164,7 +164,7 @@
             <option value="100">100</option>
           </select>
         </div>
-        <p id="tableSummary">Showing 0 objects.</p>
+        <p id="tableSummary">Loading catalog page...</p>
         <div class="pagination-controls">
           <button id="tablePrevPage" type="button">Prev</button>
           <span id="tablePageIndicator">Page 1 / 1</span>
