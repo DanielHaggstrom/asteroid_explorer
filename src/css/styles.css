@@ -190,6 +190,13 @@ output {
   font-weight: 700;
 }
 
+.kpi-card .kpi-meta {
+  margin-top: 4px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
 .chart-grid,
 .explorer-grid {
   display: grid;

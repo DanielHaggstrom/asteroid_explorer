@@ -24,6 +24,7 @@ const elements = {
   mapDensityRange: document.getElementById("mapDensityRange"),
   mapDensityValue: document.getElementById("mapDensityValue"),
   kpiTotal: document.getElementById("kpiTotal"),
+  kpiTotalMeta: document.getElementById("kpiTotalMeta"),
   kpiDiameterCoverage: document.getElementById("kpiDiameterCoverage"),
   kpiMeanDiameter: document.getElementById("kpiMeanDiameter"),
   kpiMeanEccentricity: document.getElementById("kpiMeanEccentricity"),
@@ -67,6 +68,11 @@ const state = {
   selectedId: null,
   mapPoints: [],
   searchRequestToken: 0,
+  meta: {
+    source: "Unknown source",
+    availableCount: null,
+    warning: null
+  },
   filters: {
     query: "",
     zone: "all",
@@ -101,8 +107,13 @@ async function bootstrap() {
     });
 
     state.allAsteroids = result.asteroids;
+    state.meta = {
+      source: result.meta.source,
+      availableCount: result.meta.availableCount,
+      warning: result.meta.warning
+    };
     state.selectedId = result.asteroids[0]?.id ?? null;
-    elements.sourceBadge.textContent = buildSourceBadgeText(result.meta);
+    renderSourceBadge();
     if (result.meta.warning) {
       setStatus(result.meta.warning, "warning");
     } else {
@@ -114,6 +125,11 @@ async function bootstrap() {
     elements.sourceBadge.textContent = "Source: unavailable";
     setStatus(`Failed to load data: ${error.message}`, true);
     state.allAsteroids = [];
+    state.meta = {
+      source: "Unavailable",
+      availableCount: null,
+      warning: null
+    };
     state.zoneFilteredAsteroids = [];
     state.filteredAsteroids = [];
     state.selectedId = null;
@@ -260,12 +276,17 @@ function renderAll() {
 
 function renderKpis() {
   const records = state.zoneFilteredAsteroids;
+  const loadedCount = state.allAsteroids.length;
+  const availableCount = state.meta.availableCount;
   const total = records.length;
   const withDiameter = records.filter((item) => Number.isFinite(item.diameterKm));
   const meanDiameter = average(withDiameter.map((item) => item.diameterKm));
   const meanEccentricity = average(records.map((item) => item.e));
 
-  elements.kpiTotal.textContent = formatNumber(total, 0);
+  elements.kpiTotal.textContent = formatNumber(loadedCount, 0);
+  elements.kpiTotalMeta.textContent = Number.isFinite(availableCount) && availableCount > 0
+    ? `of ${formatNumber(availableCount, 0)} cataloged`
+    : "sample currently loaded";
   elements.kpiDiameterCoverage.textContent = `${formatNumber(withDiameter.length, 0)} / ${formatNumber(total, 0)}`;
   elements.kpiMeanDiameter.textContent = formatWithUnit(meanDiameter, "km", 2);
   elements.kpiMeanEccentricity.textContent = formatNumber(meanEccentricity, 4);
@@ -488,6 +509,7 @@ async function fetchRemoteSearch(query, requestToken) {
     const remoteAsteroids = Array.isArray(payload.asteroids) ? payload.asteroids : [];
     if (remoteAsteroids.length > 0) {
       state.allAsteroids = mergeAsteroids(state.allAsteroids, remoteAsteroids);
+      renderSourceBadge();
       applyFiltersAndRender();
     }
   } catch (error) {
@@ -527,11 +549,15 @@ function debounce(fn, delayMs) {
 }
 
 function buildSourceBadgeText(meta) {
-  const loaded = formatNumber(meta.loadedCount, 0);
+  const loaded = formatNumber(state.allAsteroids.length || meta.loadedCount, 0);
   if (Number.isFinite(meta.availableCount) && meta.availableCount > 0) {
     const available = formatNumber(meta.availableCount, 0);
     return `Source: ${meta.source} (${loaded} / ${available} loaded)`;
   }
   return `Source: ${meta.source} (${loaded} loaded)`;
+}
+
+function renderSourceBadge() {
+  elements.sourceBadge.textContent = buildSourceBadgeText(state.meta);
 }
 
