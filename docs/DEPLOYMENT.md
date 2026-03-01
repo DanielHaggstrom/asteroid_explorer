@@ -8,6 +8,7 @@
 1. The app is deployed as a Render Node web service.
 2. Static frontend assets and API endpoints are served by the same Node process.
 3. This avoids browser-side CORS issues against the NASA/JPL APIs.
+4. Cold starts are softened by a bundled startup sample that can be served immediately before live data refresh completes.
 
 ## Render Configuration
 1. Runtime: `Node`
@@ -21,6 +22,10 @@
 3. If you want the full local catalog in production, either:
 - generate it before deployment and ship it with the release artifacts, or
 - deploy on infrastructure with persistent storage.
+4. The live deployment therefore uses a hybrid approach:
+- bundled startup sample for immediate response,
+- live JPL refresh for fresher data after startup,
+- fallback snapshot for upstream failure scenarios.
 
 ## Operational Notes
 1. The current live deployment works without secrets.

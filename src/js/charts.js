@@ -20,7 +20,9 @@ export function drawBarChart(canvas, buckets) {
   }
 
   const { ctx, width, height } = prepared;
-  const labels = Object.keys(buckets);
+  const compactMode = width < 460;
+  const crampedMode = width < 360;
+  const labels = Object.keys(buckets).map((label) => compactMode ? shortenBucketLabel(label) : label);
   const values = Object.values(buckets);
   const maxValue = Math.max(...values, 1);
 
@@ -29,12 +31,19 @@ export function drawBarChart(canvas, buckets) {
     return;
   }
 
-  const margin = { top: 24, right: 14, bottom: 72, left: 56 };
+  const margin = compactMode
+    ? { top: 20, right: 8, bottom: crampedMode ? 88 : 80, left: crampedMode ? 40 : 46 }
+    : { top: 24, right: 14, bottom: 72, left: 56 };
   const plotWidth = width - margin.left - margin.right;
   const plotHeight = height - margin.top - margin.bottom;
+  if (plotWidth <= 0 || plotHeight <= 0) {
+    drawNoDataLabel(ctx, width, height, "Chart sizing pending");
+    return;
+  }
   const barWidth = plotWidth / labels.length;
   const palette = ["#2e8a80", "#4098a2", "#58a4b8", "#6da7c5", "#88a2c7", "#b69dc5", "#d38f8d", "#c2572f", "#9b8d78"];
-  const rotateLabels = labels.length > 6;
+  const rotateLabels = labels.length > 6 || compactMode;
+  const labelFontSize = crampedMode ? 10 : 11;
 
   drawAxes(ctx, margin.left, margin.top, plotWidth, plotHeight);
   drawYAxisTicks(ctx, margin.left, margin.top, plotHeight, maxValue);
@@ -44,20 +53,22 @@ export function drawBarChart(canvas, buckets) {
     const barHeight = (value / maxValue) * plotHeight;
     const x = margin.left + index * barWidth + 2;
     const y = margin.top + plotHeight - barHeight;
-    const widthPerBar = Math.max(8, barWidth - 4);
+    const widthPerBar = Math.max(crampedMode ? 6 : 8, barWidth - (compactMode ? 2 : 4));
 
     ctx.fillStyle = palette[index % palette.length];
     ctx.fillRect(x, y, widthPerBar, barHeight);
 
     ctx.fillStyle = "#354757";
-    ctx.font = `11px ${FONT_FAMILY}`;
+    ctx.font = `${labelFontSize}px ${FONT_FAMILY}`;
     ctx.textAlign = "center";
-    ctx.fillText(String(value), x + widthPerBar / 2, y - 6);
+    if (!compactMode) {
+      ctx.fillText(String(value), x + widthPerBar / 2, y - 6);
+    }
 
     if (rotateLabels) {
       ctx.save();
-      ctx.translate(x + widthPerBar / 2, height - 20);
-      ctx.rotate(-Math.PI / 5);
+      ctx.translate(x + widthPerBar / 2, height - (crampedMode ? 16 : 18));
+      ctx.rotate(-(compactMode ? Math.PI / 3.4 : Math.PI / 5));
       ctx.textAlign = "right";
       ctx.fillText(label, 0, 0);
       ctx.restore();
@@ -69,7 +80,7 @@ export function drawBarChart(canvas, buckets) {
   ctx.fillStyle = "#4a5d6f";
   ctx.font = `12px ${FONT_FAMILY}`;
   ctx.textAlign = "left";
-  ctx.fillText("Objects", 8, margin.top + 6);
+  ctx.fillText("Objects", compactMode ? 6 : 8, margin.top + 6);
 }
 
 export function drawScatterPlot(canvas, asteroids) {
@@ -448,6 +459,20 @@ function drawNoDataLabel(ctx, width, height, message) {
   ctx.font = `600 15px ${FONT_FAMILY}`;
   ctx.textAlign = "center";
   ctx.fillText(message, width / 2, height / 2);
+}
+
+function shortenBucketLabel(label) {
+  const shortLabels = {
+    "<0.5 km": "<0.5",
+    "0.5-1 km": "0.5-1",
+    "1-2 km": "1-2",
+    "2-5 km": "2-5",
+    "5-10 km": "5-10",
+    "10-20 km": "10-20",
+    "20-50 km": "20-50",
+    ">=50 km": "50+"
+  };
+  return shortLabels[label] ?? label;
 }
 
 function prepareCanvas(canvas) {

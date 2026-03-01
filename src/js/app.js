@@ -58,6 +58,7 @@ const elements = {
 
 const REMOTE_SEARCH_MIN_QUERY_LENGTH = 2;
 const REMOTE_SEARCH_LIMIT = 25;
+let visualizationResizeObserver = null;
 
 const state = {
   allAsteroids: [],
@@ -84,6 +85,9 @@ const state = {
 const triggerRemoteSearch = debounce((query, token) => {
   void fetchRemoteSearch(query, token);
 }, 420);
+const triggerVisualizationRerender = debounce(() => {
+  renderVisualizations();
+}, 120);
 
 attachListeners();
 bootstrap();
@@ -105,6 +109,7 @@ async function bootstrap() {
       setStatus("Data loaded.");
     }
     applyFiltersAndRender();
+    requestAnimationFrame(() => renderVisualizations());
   } catch (error) {
     elements.sourceBadge.textContent = "Source: unavailable";
     setStatus(`Failed to load data: ${error.message}`, true);
@@ -213,7 +218,8 @@ function attachListeners() {
     renderVisualizations();
   });
 
-  window.addEventListener("resize", debounce(() => renderVisualizations(), 140));
+  attachVisualizationResizeObserver();
+  window.addEventListener("resize", triggerVisualizationRerender);
 }
 
 function applyFiltersAndRender() {
@@ -277,6 +283,29 @@ function renderVisualizations() {
     state.selectedId,
     state.filters.mapDensity
   );
+}
+
+function attachVisualizationResizeObserver() {
+  if (typeof ResizeObserver === "undefined") {
+    return;
+  }
+
+  visualizationResizeObserver?.disconnect();
+  visualizationResizeObserver = new ResizeObserver(() => {
+    triggerVisualizationRerender();
+  });
+
+  [
+    elements.sizeChart,
+    elements.orbitScatterChart,
+    elements.semiMajorAxisChart,
+    elements.trueAnomalyChart,
+    elements.beltMap
+  ].forEach((element) => {
+    if (element) {
+      visualizationResizeObserver.observe(element);
+    }
+  });
 }
 
 function renderTable() {

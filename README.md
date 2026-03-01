@@ -45,11 +45,12 @@ Primary source:
 Runtime access model:
 1. Browser calls same-origin `/api/main-belt` (Node proxy).
 2. If local catalog files exist, proxy serves random sampled chunks from local storage.
-3. Search uses local catalog index first; if no local match is found, it falls back to JPL API search.
-4. Background API refresh updates an in-memory overlay for fresher objects.
-5. If upstream is unavailable, app serves local fallback snapshot (`data/main-belt-fallback.json`).
+3. If no local catalog is present, the server can serve a bundled startup snapshot for fast cold starts and then refresh live data in the background.
+4. Search uses local catalog index first; if no local match is found, it falls back to JPL API search.
+5. Background API refresh updates an in-memory overlay for fresher objects.
+6. If upstream is unavailable, app serves local fallback snapshot (`data/main-belt-fallback.json`).
 
-By default, the proxy loads a random sample window of 50,000 main-belt objects per refresh for interactive performance (the API itself has far more).
+By default, the proxy loads a random live sample window of 20,000 main-belt objects per refresh for interactive performance (the API itself has far more).
 
 Reference docs:
 - https://ssd-api.jpl.nasa.gov/doc/sbdb_query.html

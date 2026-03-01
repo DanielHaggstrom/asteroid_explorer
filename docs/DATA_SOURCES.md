@@ -23,7 +23,8 @@
 1. Browser requests same-origin endpoint `/api/main-belt`.
 2. Node server proxies and normalizes JPL data to avoid client CORS/network failures.
 3. If local snapshot files are available (`data/catalog/manifest.json`), `/api/main-belt` samples from local chunks first.
-4. `/api/search?q=...` searches local index first; only if local misses does it query live SBDB APIs.
-5. Background refresh periodically pulls live API windows and overlays fresher records in-memory.
-6. If JPL is unavailable and no local snapshot is available, fallback snapshot (`data/main-belt-fallback.json`) keeps UI functional.
-7. Client-side direct calls to JPL are intentionally disabled.
+4. If no local catalog is present, a bundled startup sample (`data/main-belt-startup.json`) can be served immediately while live data warms in the background.
+5. `/api/search?q=...` searches local index first; only if local misses does it query live SBDB APIs.
+6. Background refresh periodically pulls live API windows and overlays fresher records in-memory.
+7. If JPL is unavailable and no local snapshot is available, fallback snapshot (`data/main-belt-fallback.json`) keeps UI functional.
+8. Client-side direct calls to JPL are intentionally disabled.

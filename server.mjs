@@ -31,15 +31,16 @@ const API_FIELDS = [
 
 const CATALOG_DIR = path.join(ROOT_DIR, "data", "catalog");
 const CATALOG_MANIFEST_PATH = path.join(CATALOG_DIR, "manifest.json");
+const STARTUP_SNAPSHOT_PATH = path.join(ROOT_DIR, "data", "main-belt-startup.json");
 
-const SAMPLE_OBJECTS = 50_000;
-const BACKGROUND_UPDATE_SAMPLE = 5_000;
+const SAMPLE_OBJECTS = 20_000;
+const BACKGROUND_UPDATE_SAMPLE = 3_000;
 const BACKGROUND_UPDATE_INTERVAL_MS = 15 * 60 * 1000;
 const OVERLAY_MAX_OBJECTS = 25_000;
 const DEFAULT_OBJECT_COUNT_ESTIMATE = 1_350_000;
 const FETCH_TIMEOUT_MS = 45_000;
 const MAX_FETCH_RETRIES = 2;
-const CACHE_TTL_MS = 10 * 60 * 1000;
+const CACHE_TTL_MS = 60 * 60 * 1000;
 const SEARCH_RESULT_LIMIT = 40;
 const SEARCH_QUERY_MAX_LEN = 80;
 
@@ -48,6 +49,7 @@ let localCatalogManifest = null;
 let lastAvailableCountEstimate = DEFAULT_OBJECT_COUNT_ESTIMATE;
 let overlayUpdatesById = new Map();
 let isOverlayRefreshInFlight = false;
+let isLiveCacheRefreshInFlight = false;
 let backgroundTimer = null;
 
 const mimeByExt = Object.freeze({
@@ -185,6 +187,18 @@ async function handleMainBeltApi(res) {
     return;
   }
 
+  if (!localCatalogManifest) {
+    const startupSnapshot = await readStartupSnapshot();
+    if (startupSnapshot) {
+      cacheEntry = { cachedAt: now, payload: startupSnapshot };
+      void refreshLiveCacheFromJpl();
+      sendJson(res, 200, startupSnapshot, {
+        "Cache-Control": "public, max-age=60"
+      });
+      return;
+    }
+  }
+
   try {
     const payload = localCatalogManifest
       ? await fetchMainBeltFromLocalCatalog()
@@ -211,6 +225,25 @@ async function handleMainBeltApi(res) {
         detail: error.message
       });
     }
+  }
+}
+
+async function refreshLiveCacheFromJpl() {
+  if (isLiveCacheRefreshInFlight || localCatalogManifest) {
+    return;
+  }
+
+  isLiveCacheRefreshInFlight = true;
+  try {
+    const payload = await fetchMainBeltFromJpl(SAMPLE_OBJECTS);
+    cacheEntry = {
+      cachedAt: Date.now(),
+      payload
+    };
+  } catch (error) {
+    console.warn(`Live cache refresh failed: ${error.message}`);
+  } finally {
+    isLiveCacheRefreshInFlight = false;
   }
 }
 
@@ -679,6 +712,29 @@ function sleep(ms) {
 async function readFallbackDataset() {
   const fallbackPath = path.join(ROOT_DIR, "data", "main-belt-fallback.json");
   return JSON.parse(await fsPromises.readFile(fallbackPath, "utf8"));
+}
+
+async function readStartupSnapshot() {
+  if (!(await fileExists(STARTUP_SNAPSHOT_PATH))) {
+    return null;
+  }
+
+  try {
+    const payload = JSON.parse(await fsPromises.readFile(STARTUP_SNAPSHOT_PATH, "utf8"));
+    return {
+      ...payload,
+      meta: {
+        ...payload.meta,
+        source: payload.meta?.source || "Bundled startup snapshot",
+        sampleMode: payload.meta?.sampleMode || "bundled-startup-snapshot",
+        fetchedAt: payload.meta?.fetchedAt || new Date().toISOString(),
+        warning: payload.meta?.warning ?? null
+      }
+    };
+  } catch (error) {
+    console.warn(`Failed to read startup snapshot: ${error.message}`);
+    return null;
+  }
 }
 
 async function loadLocalCatalogManifest() {
