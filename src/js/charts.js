@@ -242,13 +242,14 @@ export function drawTrueAnomalyHistogram(canvas, asteroids) {
   ctx.fillText("True anomaly (deg)", margin.left + plotWidth / 2, height - 10);
 }
 
-export function drawBeltMap(canvas, asteroids, selectedId, maxPoints) {
+export function drawBeltMap(canvas, asteroids, selectedAsteroid, maxPoints) {
   const prepared = prepareCanvas(canvas);
   if (!prepared) {
     return [];
   }
 
   const { ctx, width, height } = prepared;
+  const selectedId = selectedAsteroid?.id ?? null;
   const centerX = width / 2;
   const centerY = height / 2;
   const maxRadiusAu = 3.5;
@@ -272,39 +273,47 @@ export function drawBeltMap(canvas, asteroids, selectedId, maxPoints) {
   ctx.arc(centerX, centerY, 7, 0, Math.PI * 2);
   ctx.fill();
 
-  const subset = downsampleAsteroids(asteroids, maxPoints, selectedId);
+  const subset = downsampleAsteroids(
+    asteroids.filter((asteroid) => asteroid?.id !== selectedId),
+    maxPoints
+  );
   const projectedPoints = [];
   for (const asteroid of subset) {
-    const position = orbitalPositionFromElements(asteroid);
-    if (!position) {
+    const projected = projectAsteroidPoint(asteroid, centerX, centerY, pxPerAu);
+    if (!projected) {
       continue;
     }
 
-    const x = centerX + position.x * pxPerAu;
-    const y = centerY + position.y * pxPerAu;
-    if (!Number.isFinite(x) || !Number.isFinite(y)) {
-      continue;
-    }
-
-    const zone = classifyBeltZone(asteroid.a);
-    const color = zoneColor(zone);
-    const isSelected = asteroid.id === selectedId;
-
-    ctx.fillStyle = color;
+    ctx.fillStyle = zoneColor(classifyBeltZone(asteroid.a));
     ctx.beginPath();
-    ctx.arc(x, y, isSelected ? 4 : 2.2, 0, Math.PI * 2);
+    ctx.arc(projected.x, projected.y, 2.2, 0, Math.PI * 2);
     ctx.fill();
 
-    if (isSelected) {
+    projectedPoints.push(projected);
+  }
+
+  if (selectedAsteroid) {
+    const projectedSelected = projectAsteroidPoint(selectedAsteroid, centerX, centerY, pxPerAu);
+    if (projectedSelected) {
+      ctx.fillStyle = zoneColor(classifyBeltZone(selectedAsteroid.a));
+      ctx.beginPath();
+      ctx.arc(projectedSelected.x, projectedSelected.y, 4, 0, Math.PI * 2);
+      ctx.fill();
+
       ctx.strokeStyle = "#b7351c";
       ctx.lineWidth = 2;
       ctx.beginPath();
-      ctx.arc(x, y, 7.5, 0, Math.PI * 2);
+      ctx.arc(projectedSelected.x, projectedSelected.y, 7.5, 0, Math.PI * 2);
       ctx.stroke();
       ctx.lineWidth = 1;
-    }
 
-    projectedPoints.push({ id: asteroid.id, x, y });
+      const existingIndex = projectedPoints.findIndex((point) => point.id === projectedSelected.id);
+      if (existingIndex >= 0) {
+        projectedPoints[existingIndex] = projectedSelected;
+      } else {
+        projectedPoints.push(projectedSelected);
+      }
+    }
   }
 
   ctx.fillStyle = "#4d6175";
@@ -491,7 +500,7 @@ function prepareCanvas(canvas) {
   return { ctx, width: rect.width, height: rect.height };
 }
 
-function downsampleAsteroids(asteroids, maxPoints, pinnedId = null) {
+function downsampleAsteroids(asteroids, maxPoints) {
   if (asteroids.length <= maxPoints) {
     return asteroids;
   }
@@ -501,15 +510,26 @@ function downsampleAsteroids(asteroids, maxPoints, pinnedId = null) {
   for (let index = 0; index < maxPoints; index += 1) {
     output.push(asteroids[Math.floor(index * step)]);
   }
+  return output;
+}
 
-  if (pinnedId && !output.some((asteroid) => asteroid.id === pinnedId)) {
-    const pinnedAsteroid = asteroids.find((asteroid) => asteroid.id === pinnedId);
-    if (pinnedAsteroid) {
-      output[output.length - 1] = pinnedAsteroid;
-    }
+function projectAsteroidPoint(asteroid, centerX, centerY, pxPerAu) {
+  const position = orbitalPositionFromElements(asteroid);
+  if (!position) {
+    return null;
   }
 
-  return output;
+  const x = centerX + position.x * pxPerAu;
+  const y = centerY + position.y * pxPerAu;
+  if (!Number.isFinite(x) || !Number.isFinite(y)) {
+    return null;
+  }
+
+  return {
+    id: asteroid.id,
+    x,
+    y
+  };
 }
 
 function zoneColor(zone) {

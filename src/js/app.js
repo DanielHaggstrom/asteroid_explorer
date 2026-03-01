@@ -293,7 +293,7 @@ function renderVisualizations() {
   state.mapPoints = drawBeltMap(
     elements.beltMap,
     records,
-    state.selectedAsteroid?.id ?? null,
+    state.selectedAsteroid,
     state.filters.mapDensity
   );
 }
