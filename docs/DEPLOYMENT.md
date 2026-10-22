@@ -87,7 +87,7 @@ Monitor local `http://127.0.0.1:4173/healthz`: HTTP 200 and JSON `ok: true` mean
 ## Runtime bounds
 
 - Query cache: 128 entries, 16 MiB serialized budget, 10-minute TTL and periodic expiry; offline catalog fallbacks use a short 30-second TTL.
-- Public API traffic: 120 requests/minute globally and 40/client/minute, bounded client tracking, and at most 16 concurrent application operations.
+- Public API traffic: 120 requests/minute globally and 40/client/minute, bounded client tracking, and at most 16 distinct cache-miss operations producing upstream work. This is not a limit on all concurrent HTTP responses or callers waiting for the same operation.
 - JPL: one active request, bounded queue of 12, duplicate-request coalescing, a 15-second total deadline including queue/body/retries, maximum 8 MiB response, one retry and shared backoff for throttling/temporary failures.
 - Static serving: only the shipped HTML, CSS and frontend JavaScript assets; repository/server/deployment/data files are not downloadable static assets.
 

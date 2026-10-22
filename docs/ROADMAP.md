@@ -4,7 +4,7 @@
 Build a browser-based asteroid-belt exploration dashboard that helps users understand population patterns, orbital structure, and individual-object properties using official public scientific data.
 
 ## Current Status
-Phase 1 is shipped and publicly deployed at `https://asteroid-explorer.onrender.com/`.
+Phase 1 is shipped and publicly deployed at `https://asteroids.classroom-fox.com/`. The previous Render deployment remains a legacy endpoint at `https://asteroid-explorer.onrender.com/`.
 
 ## Phase 1: Production MVP
 1. Data foundation

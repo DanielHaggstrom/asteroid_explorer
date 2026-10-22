@@ -14,7 +14,7 @@
 
 ## Backend Safety Controls
 1. The server exposes fixed-purpose routes only: `/api/main-belt`, `/api/catalog`, `/api/search`, and `/healthz`.
-2. Methods are restricted to `GET` for API routes and static assets.
+2. API routes accept `GET`; static assets accept `GET` and `HEAD`.
 3. Security headers are set by the server (`nosniff`, referrer policy, permissions policy).
 4. Static serving uses an explicit public asset allowlist and traversal protection; repository, server, data and deployment files are not public assets.
 5. Search and catalog filters are normalized before being forwarded upstream.
