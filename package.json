@@ -1,24 +1,24 @@
-﻿{
+{
   "name": "asteroid-explorer",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "type": "module",
   "description": "Browser dashboard for exploring asteroid-belt objects using official JPL SBDB API data.",
   "author": "Daniel Häggström Pérez-Flecha",
   "license": "MIT",
-  "homepage": "https://asteroid-explorer.onrender.com/",
+  "homepage": "https://asteroids.classroom-fox.com/",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/DanielHaggstrom/asteroid_explorer.git"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "scripts": {
     "dev": "node server.mjs",
     "serve": "node server.mjs",
     "sample:update": "node scripts/update_startup_sample.mjs",
     "sample:update:commit": "node scripts/update_startup_sample.mjs --commit",
-    "test": "node tests/utils.test.mjs"
+    "test": "node --test tests/*.test.mjs"
   }
 }

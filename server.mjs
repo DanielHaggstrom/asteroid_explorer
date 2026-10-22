@@ -1,5 +1,6 @@
-﻿import fsPromises from "node:fs/promises";
+import fsPromises from "node:fs/promises";
 import http from "node:http";
+import { isIP } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -7,15 +8,18 @@ import {
   OBJECT_API_BASE_URL,
   buildQueryApiUrl,
   dedupeAsteroids,
-  fetchJsonWithRetries,
+  fetchJsonWithRetries as defaultFetchJsonWithRetries,
   mapQueryPayloadToAsteroids,
   sanitizeConstraintValue
 } from "./lib/jpl-api.mjs";
+import { BoundedCache, ApiLimiter } from "./lib/resource-limits.mjs";
+import { UpstreamError } from "./lib/jpl-client.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const ROOT_DIR = __dirname;
 const PORT = Number(process.env.PORT || 4173);
+const HOST = process.env.HOST || "0.0.0.0";
 
 const STARTUP_SAMPLE_PATH = path.join(ROOT_DIR, "data", "main-belt-startup.json");
 
@@ -24,9 +28,8 @@ const TABLE_PAGE_SIZE_DEFAULT = 25;
 const TABLE_PAGE_SIZE_MAX = 100;
 const SEARCH_RESULT_LIMIT = 20;
 const SEARCH_QUERY_MAX_LEN = 80;
-const FETCH_TIMEOUT_MS = 45_000;
-const MAX_FETCH_RETRIES = 2;
-const QUERY_CACHE_TTL_MS = 10 * 60 * 1000;
+const FETCH_TIMEOUT_MS = 15_000;
+const MAX_FETCH_RETRIES = 1;
 const SAMPLE_REFRESH_DELAY_MS = 45_000;
 const SAMPLE_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
 const SAMPLE_REFRESH_BATCH_SIZE = 20;
@@ -45,721 +48,809 @@ const mimeByExt = Object.freeze({
   ".jpeg": "image/jpeg"
 });
 
-const sampleState = {
-  asteroids: [],
-  meta: {
-    source: "Prepared startup sample",
-    availableCount: null,
-    sampleMode: "prepared-startup-sample",
-    warning: null,
-    coreObjectIds: [],
-    generatedAt: null,
-    lastRefreshedAt: null
+const PUBLIC_FILES = new Set([
+  "/index.html", "/src/css/styles.css", "/src/js/app.js",
+  "/src/js/charts.js", "/src/js/config.js", "/src/js/dataService.js", "/src/js/utils.js", "/src/js/resultCache.js"
+]);
+
+export function createApplication(options = {}) {
+  const fetchJsonWithRetries = options.fetchJson ?? (process.env.JPL_API_ENABLED === "false"
+    ? async () => { throw new UpstreamError("Live JPL access is disabled.", { statusCode: 503 }); }
+    : defaultFetchJsonWithRetries);
+  const startupSamplePath = options.startupSamplePath ?? STARTUP_SAMPLE_PATH;
+  const backgroundEnabled = options.backgroundEnabled ?? process.env.JPL_REFRESH_ENABLED !== "false";
+  const trustedProxyIps = new Set((options.trustedProxyIps ?? (process.env.TRUSTED_PROXY_IPS || "").split(","))
+    .map((value) => normalizeIp(value.trim())).filter((value) => isIP(value)));
+  const limiter = options.limiter ?? new ApiLimiter();
+  const sampleState = {
+    asteroids: [],
+    meta: {
+      source: "Prepared startup sample",
+      availableCount: null,
+      sampleMode: "prepared-startup-sample",
+      warning: null,
+      coreObjectIds: [],
+      generatedAt: null,
+      lastRefreshedAt: null
+    }
+  };
+
+  const responseCache = new BoundedCache(options.cacheOptions);
+  const payloadInFlight = new Map();
+  let initializationPromise;
+  let isSampleRefreshInFlight = false;
+  let sampleRefreshCursor = 0;
+  let backgroundTimer = null;
+  let backgroundDelayTimer = null;
+
+  const server = http.createServer(async (req, res) => {
+    try {
+      if (!req.url || req.url.length > 2048) {
+        sendJson(res, 414, { error: "Request URL is too long." }); return;
+      }
+      const requestUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+
+      if (req.method === "GET" && requestUrl.pathname === "/healthz") {
+        const ok = sampleState.asteroids.length > 0;
+        sendJson(res, ok ? 200 : 503, { ok, loadedCount: sampleState.asteroids.length }, { "Cache-Control": "no-store" });
+        return;
+      }
+
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        sendJson(res, 405, { error: "Method not allowed." }, { Allow: "GET, HEAD" }); return;
+      }
+      if (req.method === "GET" && ["/api/main-belt", "/api/catalog", "/api/search"].includes(requestUrl.pathname)) {
+        const retryAfter = limiter.admit(clientAddress(req));
+        if (retryAfter) {
+          sendJson(res, 429, { error: "Request limit reached; try again shortly." }, { "Retry-After": String(retryAfter), "Cache-Control": "no-store" }); return;
+        }
+      }
+
+      if (req.method === "GET" && requestUrl.pathname === "/api/main-belt") {
+        await handleMainBeltApi(res);
+        return;
+      }
+
+      if (req.method === "GET" && requestUrl.pathname === "/api/catalog") {
+        await handleCatalogApi(requestUrl, res);
+        return;
+      }
+
+      if (req.method === "GET" && requestUrl.pathname === "/api/search") {
+        await handleSearchApi(requestUrl, res);
+        return;
+      }
+
+      await serveStatic(requestUrl.pathname, req.method, res);
+    } catch (error) {
+      if (!res.headersSent) sendJson(res, error instanceof URIError || error instanceof TypeError ? 400 : 500, { error: "Request could not be processed." });
+      else res.destroy();
+    }
+  });
+
+  server.headersTimeout = 10_000;
+  server.requestTimeout = 20_000;
+  server.keepAliveTimeout = 5_000;
+  server.maxHeadersCount = 40;
+  server.maxRequestsPerSocket = 100;
+  const ready = initializeStartupSample();
+  server.on("close", () => {
+    clearTimeout(backgroundDelayTimer); clearInterval(backgroundTimer); responseCache.close();
+  });
+  return { server, ready, refreshSample: refreshLoadedSampleInMemory,
+    get sampleCount() { return sampleState.asteroids.length; } };
+
+  function clientAddress(req) {
+    const peer = normalizeIp(req.socket.remoteAddress || "unknown");
+    const claimed = req.headers["x-real-ip"];
+    return trustedProxyIps.has(peer) && typeof claimed === "string" && isIP(claimed)
+      ? normalizeIp(claimed) : peer;
   }
-};
 
-const responseCache = new Map();
-let isSampleInitializationInFlight = false;
-let isSampleRefreshInFlight = false;
-let sampleRefreshCursor = 0;
-let backgroundTimer = null;
-
-const server = http.createServer(async (req, res) => {
-  try {
-    const requestUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
-
-    if (req.method === "GET" && requestUrl.pathname === "/healthz") {
-      sendJson(res, 200, { ok: true });
-      return;
-    }
-
-    if (req.method === "GET" && requestUrl.pathname === "/api/main-belt") {
-      await handleMainBeltApi(res);
-      return;
-    }
-
-    if (req.method === "GET" && requestUrl.pathname === "/api/catalog") {
-      await handleCatalogApi(requestUrl, res);
-      return;
-    }
-
-    if (req.method === "GET" && requestUrl.pathname === "/api/search") {
-      await handleSearchApi(requestUrl, res);
-      return;
-    }
-
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      sendJson(res, 405, { error: "Method not allowed." });
-      return;
-    }
-
-    await serveStatic(requestUrl.pathname, req.method, res);
-  } catch (error) {
-    sendJson(res, 500, { error: "Internal server error.", detail: error.message });
+  function initializeStartupSample() {
+    if (!initializationPromise) initializationPromise = loadStartupSample();
+    return initializationPromise;
   }
-});
+  async function loadStartupSample() {
+    try {
+      const payload = await readPreparedStartupSample();
+      if (payload) {
+        hydrateSampleState(payload);
+        startBackgroundSampleRefreshLoop();
+        console.log(`Loaded prepared startup sample with ${sampleState.asteroids.length} objects.`);
+        return;
+      }
 
-server.listen(PORT, () => {
-  console.log(`Asteroid Explorer server running on http://localhost:${PORT}`);
-  void initializeStartupSample();
-});
-
-async function initializeStartupSample() {
-  if (isSampleInitializationInFlight || sampleState.asteroids.length > 0) {
-    return;
-  }
-
-  isSampleInitializationInFlight = true;
-  try {
-    const payload = await readPreparedStartupSample();
-    if (payload) {
-      hydrateSampleState(payload);
+      if (options.liveFallback === false) return;
+      const livePayload = await fetchRandomWindowSample(DEFAULT_STARTUP_SAMPLE_SIZE);
+      livePayload.meta.warning = "Prepared startup sample missing. Serving a live JPL sample.";
+      hydrateSampleState(livePayload);
       startBackgroundSampleRefreshLoop();
-      console.log(`Loaded prepared startup sample with ${sampleState.asteroids.length} objects.`);
-      return;
+      console.warn("Prepared startup sample was unavailable. Using a live JPL sample instead.");
+    } catch (error) {
+      console.warn(`Startup sample initialization failed: ${error.message}`);
     }
-
-    const livePayload = await fetchRandomWindowSample(DEFAULT_STARTUP_SAMPLE_SIZE);
-    livePayload.meta.warning = "Prepared startup sample missing. Serving a live JPL sample.";
-    hydrateSampleState(livePayload);
-    startBackgroundSampleRefreshLoop();
-    console.warn("Prepared startup sample was unavailable. Using a live JPL sample instead.");
-  } catch (error) {
-    console.warn(`Startup sample initialization failed: ${error.message}`);
-  } finally {
-    isSampleInitializationInFlight = false;
-  }
-}
-
-function hydrateSampleState(payload) {
-  const asteroids = dedupeAsteroids(Array.isArray(payload?.asteroids) ? payload.asteroids : []);
-  const meta = payload?.meta ?? {};
-
-  sampleState.asteroids = asteroids;
-  sampleState.meta = {
-    source: meta.source ?? "Prepared startup sample",
-    availableCount: toFiniteNumber(meta.availableCount),
-    sampleMode: meta.sampleMode ?? "prepared-startup-sample",
-    warning: meta.warning ?? null,
-    coreObjectIds: Array.isArray(meta.coreObjectIds) ? meta.coreObjectIds.map(String) : [],
-    generatedAt: meta.generatedAt ?? meta.fetchedAt ?? null,
-    lastRefreshedAt: meta.lastRefreshedAt ?? null
-  };
-}
-
-function buildSamplePayload() {
-  return {
-    meta: {
-      source: sampleState.meta.source,
-      fetchedAt: new Date().toISOString(),
-      generatedAt: sampleState.meta.generatedAt,
-      lastRefreshedAt: sampleState.meta.lastRefreshedAt,
-      loadedCount: sampleState.asteroids.length,
-      availableCount: sampleState.meta.availableCount,
-      sampleMode: sampleState.meta.sampleMode,
-      warning: sampleState.meta.warning,
-      coreObjectIds: sampleState.meta.coreObjectIds
-    },
-    asteroids: sampleState.asteroids
-  };
-}
-
-function startBackgroundSampleRefreshLoop() {
-  if (backgroundTimer) {
-    clearInterval(backgroundTimer);
   }
 
-  setTimeout(() => {
-    void refreshLoadedSampleInMemory();
-  }, SAMPLE_REFRESH_DELAY_MS);
+  function hydrateSampleState(payload) {
+    const asteroids = dedupeAsteroids((Array.isArray(payload?.asteroids) ? payload.asteroids : [])
+      .filter((row) => row && typeof row.id === "string" && typeof row.name === "string" &&
+        [row.a, row.e, row.i].every((value) => typeof value === "number" && Number.isFinite(value))));
+    if (!asteroids.length) throw new Error("Startup sample has no valid asteroid records.");
+    const meta = payload?.meta ?? {};
 
-  backgroundTimer = setInterval(() => {
-    void refreshLoadedSampleInMemory();
-  }, SAMPLE_REFRESH_INTERVAL_MS);
-}
-
-async function refreshLoadedSampleInMemory() {
-  if (isSampleRefreshInFlight || sampleState.asteroids.length === 0) {
-    return;
+    sampleState.asteroids = asteroids;
+    sampleState.meta = {
+      source: meta.source ?? "Prepared startup sample",
+      availableCount: toFiniteNumber(meta.availableCount),
+      sampleMode: meta.sampleMode ?? "prepared-startup-sample",
+      warning: meta.warning ?? null,
+      coreObjectIds: Array.isArray(meta.coreObjectIds) ? meta.coreObjectIds.map(String) : [],
+      generatedAt: meta.generatedAt ?? meta.fetchedAt ?? null,
+      lastRefreshedAt: meta.lastRefreshedAt ?? null
+    };
   }
 
-  isSampleRefreshInFlight = true;
-  try {
-    const refreshTargets = getNextRefreshTargets(sampleState.asteroids, SAMPLE_REFRESH_OBJECT_COUNT);
-    const refreshed = [];
-    for (const chunk of chunkArray(refreshTargets, SAMPLE_REFRESH_BATCH_SIZE)) {
-      const rows = await fetchAsteroidsByIdentifiers(
-        chunk.map((asteroid) => asteroid.id),
-        "spkid"
-      );
-      refreshed.push(...rows);
-    }
-
-    if (!refreshed.length) {
-      return;
-    }
-
-    const refreshedById = new Map(refreshed.map((asteroid) => [asteroid.id, asteroid]));
-    sampleState.asteroids = sampleState.asteroids.map((asteroid) => refreshedById.get(asteroid.id) ?? asteroid);
-    sampleState.meta.lastRefreshedAt = new Date().toISOString();
-    sampleState.meta.source = "Prepared startup sample + live JPL refresh";
-  } catch (error) {
-    console.warn(`Background sample refresh failed: ${error.message}`);
-  } finally {
-    isSampleRefreshInFlight = false;
-  }
-}
-
-function getNextRefreshTargets(asteroids, count) {
-  if (asteroids.length <= count) {
-    return asteroids.slice();
-  }
-
-  const output = [];
-  for (let index = 0; index < count; index += 1) {
-    output.push(asteroids[(sampleRefreshCursor + index) % asteroids.length]);
-  }
-  sampleRefreshCursor = (sampleRefreshCursor + count) % asteroids.length;
-  return output;
-}
-
-async function handleMainBeltApi(res) {
-  await ensureStartupSampleReady();
-  if (sampleState.asteroids.length === 0) {
-    sendJson(res, 502, {
-      error: "Failed to load asteroid data.",
-      detail: "No prepared startup sample or live fallback is available."
-    });
-    return;
-  }
-
-  sendJson(res, 200, buildSamplePayload(), {
-    "Cache-Control": "public, max-age=60"
-  });
-}
-
-async function handleCatalogApi(requestUrl, res) {
-  const query = normalizeCatalogQuery(requestUrl.searchParams);
-  const cacheKey = `catalog:${JSON.stringify(query)}`;
-  const cached = getCachedPayload(cacheKey);
-  if (cached) {
-    sendJson(res, 200, cached, {
-      "Cache-Control": "public, max-age=60"
-    });
-    return;
-  }
-
-  try {
-    const payload = await fetchCatalogPage(query);
-    setCachedPayload(cacheKey, payload);
-    sendJson(res, 200, payload, {
-      "Cache-Control": "public, max-age=60"
-    });
-  } catch (error) {
-    sendJson(res, 502, {
-      error: "Failed to load catalog page.",
-      detail: error.message
-    });
-  }
-}
-
-async function handleSearchApi(requestUrl, res) {
-  const query = (requestUrl.searchParams.get("q") ?? "").trim().slice(0, SEARCH_QUERY_MAX_LEN);
-  const limit = clampInt(requestUrl.searchParams.get("limit"), 1, SEARCH_RESULT_LIMIT, 8);
-
-  if (!query) {
-    sendJson(res, 200, {
+  function buildSamplePayload() {
+    return {
       meta: {
-        source: "NASA/JPL SBDB APIs",
-        query,
-        loadedCount: 0,
-        availableCount: null
+        source: sampleState.meta.source,
+        fetchedAt: new Date().toISOString(),
+        generatedAt: sampleState.meta.generatedAt,
+        lastRefreshedAt: sampleState.meta.lastRefreshedAt,
+        loadedCount: sampleState.asteroids.length,
+        availableCount: sampleState.meta.availableCount,
+        sampleMode: sampleState.meta.sampleMode,
+        warning: sampleState.meta.warning,
+        coreObjectIds: sampleState.meta.coreObjectIds
       },
-      asteroids: []
-    }, {
-      "Cache-Control": "no-store"
-    });
-    return;
+      asteroids: sampleState.asteroids
+    };
   }
 
-  const cacheKey = `search:${query.toLowerCase()}:${limit}`;
-  const cached = getCachedPayload(cacheKey);
-  if (cached) {
-    sendJson(res, 200, cached, {
-      "Cache-Control": "no-store"
-    });
-    return;
+  function startBackgroundSampleRefreshLoop() {
+    if (!backgroundEnabled) return;
+    if (backgroundTimer) {
+      clearInterval(backgroundTimer);
+    }
+
+    backgroundDelayTimer = setTimeout(() => {
+      void refreshLoadedSampleInMemory();
+    }, SAMPLE_REFRESH_DELAY_MS);
+    backgroundDelayTimer.unref();
+
+    backgroundTimer = setInterval(() => {
+      void refreshLoadedSampleInMemory();
+    }, SAMPLE_REFRESH_INTERVAL_MS);
+    backgroundTimer.unref();
   }
 
-  try {
-    const payload = await searchAsteroids(query, limit);
-    setCachedPayload(cacheKey, payload);
-    sendJson(res, 200, payload, {
-      "Cache-Control": "no-store"
-    });
-  } catch (error) {
-    sendJson(res, 502, {
-      error: "Search request failed.",
-      detail: error.message
+  async function refreshLoadedSampleInMemory() {
+    if (isSampleRefreshInFlight || sampleState.asteroids.length === 0) {
+      return;
+    }
+
+    isSampleRefreshInFlight = true;
+    try {
+      const refreshTargets = getNextRefreshTargets(sampleState.asteroids, SAMPLE_REFRESH_OBJECT_COUNT);
+      const refreshed = [];
+      for (const chunk of chunkArray(refreshTargets, SAMPLE_REFRESH_BATCH_SIZE)) {
+        const rows = await fetchAsteroidsByIdentifiers(
+          chunk.map((asteroid) => asteroid.id),
+          "spkid"
+        );
+        refreshed.push(...rows);
+      }
+
+      if (!refreshed.length) {
+        return;
+      }
+
+      const refreshedById = new Map(refreshed.map((asteroid) => [asteroid.id, asteroid]));
+      sampleState.asteroids = sampleState.asteroids.map((asteroid) => refreshedById.get(asteroid.id) ?? asteroid);
+      sampleState.meta.lastRefreshedAt = new Date().toISOString();
+      sampleState.meta.source = "Prepared startup sample + live JPL refresh";
+    } catch (error) {
+      console.warn(`Background sample refresh failed: ${error.message}`);
+    } finally {
+      isSampleRefreshInFlight = false;
+    }
+  }
+
+  function getNextRefreshTargets(asteroids, count) {
+    if (asteroids.length <= count) {
+      return asteroids.slice();
+    }
+
+    const output = [];
+    for (let index = 0; index < count; index += 1) {
+      output.push(asteroids[(sampleRefreshCursor + index) % asteroids.length]);
+    }
+    sampleRefreshCursor = (sampleRefreshCursor + count) % asteroids.length;
+    return output;
+  }
+
+  async function handleMainBeltApi(res) {
+    await ensureStartupSampleReady();
+    if (sampleState.asteroids.length === 0) {
+      sendJson(res, 503, {
+        error: "Failed to load asteroid data.",
+        detail: "No prepared startup sample or live fallback is available."
+      });
+      return;
+    }
+
+    sendJson(res, 200, buildSamplePayload(), {
+      "Cache-Control": "public, max-age=60"
     });
   }
-}
 
-async function fetchCatalogPage(query) {
-  const clauses = buildCatalogClauses(query);
-  const sort = buildCatalogSort(query.sortKey, query.sortDirection);
-  const offset = Math.max(0, (query.page - 1) * query.pageSize);
+  async function handleCatalogApi(requestUrl, res) {
+    await ensureStartupSampleReady();
+    const query = normalizeCatalogQuery(requestUrl.searchParams);
+    const cacheKey = `catalog:${JSON.stringify(query)}`;
+    const cached = getCachedPayload(cacheKey);
+    if (cached) {
+      sendJson(res, 200, cached, {
+        "Cache-Control": cached.meta?.warning ? "public, max-age=30" : "public, max-age=60"
+      });
+      return;
+    }
 
-  const url = buildQueryApiUrl({
-    fields: API_FIELDS,
-    limit: query.pageSize,
-    offset,
-    sort,
-    clauses,
-    clauseMode: "AND"
-  });
+    try {
+      const payload = await loadSharedPayload(cacheKey, () => fetchCatalogPage(query));
+      sendJson(res, 200, payload, {
+        "Cache-Control": "public, max-age=60"
+      });
+    } catch (error) {
+      if (sampleState.asteroids.length && !(error instanceof UpstreamError && error.statusCode === 503 && error.message === "Too many distinct requests in progress.")) {
+        const fallback = buildSampleCatalog(query);
+        responseCache.set(cacheKey, fallback, 30_000);
+        sendJson(res, 200, fallback, { "Cache-Control": "public, max-age=30" });
+        return;
+      }
+      sendJson(res, error.statusCode ?? 502, {
+        error: "Failed to load catalog page.",
+        detail: error.message
+      }, { "Retry-After": String(error.retryAfter ?? 5), "Cache-Control": "no-store" });
+    }
+  }
 
-  const payload = await fetchJsonWithRetries(url, {
-    timeoutMs: FETCH_TIMEOUT_MS,
-    maxRetries: MAX_FETCH_RETRIES
-  });
+  async function handleSearchApi(requestUrl, res) {
+    const query = (requestUrl.searchParams.get("q") ?? "").trim().slice(0, SEARCH_QUERY_MAX_LEN);
+    const limit = clampInt(requestUrl.searchParams.get("limit"), 1, SEARCH_RESULT_LIMIT, 8);
 
-  const asteroids = mapQueryPayloadToAsteroids(payload);
-  const totalCount = toFiniteNumber(payload?.count) ?? asteroids.length;
+    if (!query) {
+      sendJson(res, 200, {
+        meta: {
+          source: "NASA/JPL SBDB APIs",
+          query,
+          loadedCount: 0,
+          availableCount: null
+        },
+        asteroids: []
+      }, {
+        "Cache-Control": "no-store"
+      });
+      return;
+    }
 
-  return {
-    meta: {
-      source: "NASA/JPL SBDB Query API",
-      fetchedAt: new Date().toISOString(),
-      page: query.page,
-      pageSize: query.pageSize,
-      totalCount,
-      sortKey: query.sortKey,
-      sortDirection: query.sortDirection,
-      zone: query.zone,
-      diameterFilter: query.diameterFilter,
-      minDiameterKm: query.minDiameterKm
-    },
-    asteroids
-  };
-}
+    const cacheKey = `search:${query.toLowerCase()}:${limit}`;
+    const cached = getCachedPayload(cacheKey);
+    if (cached) {
+      sendJson(res, 200, cached, {
+        "Cache-Control": "no-store"
+      });
+      return;
+    }
 
-async function searchAsteroids(rawQuery, limit) {
-  const localMatches = searchPreparedSample(rawQuery, limit);
-  const exactMatch = await resolveExactMatch(rawQuery).catch(() => null);
-  const exactMatches = exactMatch ? [exactMatch] : [];
-  const asteroids = dedupeAsteroids([...exactMatches, ...localMatches]).slice(0, limit);
+    try {
+      const payload = await loadSharedPayload(cacheKey, () => searchAsteroids(query, limit));
+      sendJson(res, 200, payload, {
+        "Cache-Control": "no-store"
+      });
+    } catch (error) {
+      sendJson(res, error.statusCode ?? 502, {
+        error: "Search request failed.",
+        detail: error.message
+      }, { "Retry-After": String(error.retryAfter ?? 5), "Cache-Control": "no-store" });
+    }
+  }
 
-  return {
-    meta: {
-      source: exactMatches.length > 0
-        ? "Prepared startup sample + NASA/JPL exact lookup"
-        : "Prepared startup sample search",
-      fetchedAt: new Date().toISOString(),
-      query: rawQuery,
-      loadedCount: asteroids.length,
-      availableCount: null
-    },
-    asteroids
-  };
-}
+  function buildSampleCatalog(query) {
+    let rows = sampleState.asteroids.filter((asteroid) =>
+      (query.zone === "all" || asteroid.zone === query.zone) &&
+      (query.diameterFilter === "all" || (query.diameterFilter === "known" ? Number.isFinite(asteroid.diameterKm) : !Number.isFinite(asteroid.diameterKm))) &&
+      (query.minDiameterKm === null || (Number.isFinite(asteroid.diameterKm) && asteroid.diameterKm >= query.minDiameterKm)));
+    const key = query.sortKey === "zone" ? "a" : query.sortKey;
+    const direction = query.sortDirection === "desc" ? -1 : 1;
+    rows = rows.slice().sort((left, right) => {
+      const a = left[key], b = right[key];
+      if (a === null || a === undefined) return b === null || b === undefined ? 0 : 1;
+      if (b === null || b === undefined) return -1;
+      return direction * (typeof a === "number" ? a - b : String(a).localeCompare(String(b)));
+    });
+    const offset = (query.page - 1) * query.pageSize;
+    return { meta: { ...query, source: "Prepared startup sample (JPL unavailable)", totalCount: rows.length,
+      fetchedAt: new Date().toISOString(), generatedAt: sampleState.meta.generatedAt,
+      warning: "Live JPL catalog is temporarily unavailable. Results are limited to the prepared startup sample." },
+      asteroids: rows.slice(offset, offset + query.pageSize) };
+  }
 
-async function resolveExactMatch(query) {
-  const url = `${OBJECT_API_BASE_URL}?${new URLSearchParams({ sstr: query }).toString()}`;
-  const payload = await fetchJsonWithRetries(url, {
-    timeoutMs: FETCH_TIMEOUT_MS,
-    maxRetries: MAX_FETCH_RETRIES
-  });
+  async function fetchCatalogPage(query) {
+    const clauses = buildCatalogClauses(query);
+    const sort = buildCatalogSort(query.sortKey, query.sortDirection);
+    const offset = Math.max(0, (query.page - 1) * query.pageSize);
 
-  return mapObjectPayloadToAsteroid(payload);
-}
-
-async function fetchRandomWindowSample(targetSize) {
-  const initialLimit = Math.max(1, Math.min(targetSize, DEFAULT_STARTUP_SAMPLE_SIZE));
-  const initialUrl = buildQueryApiUrl({
-    fields: API_FIELDS,
-    limit: 1
-  });
-  const initialPayload = await fetchJsonWithRetries(initialUrl, {
-    timeoutMs: FETCH_TIMEOUT_MS,
-    maxRetries: MAX_FETCH_RETRIES
-  });
-  const availableCount = Math.max(initialLimit, toFiniteNumber(initialPayload?.count) ?? initialLimit);
-  const maxOffset = Math.max(0, availableCount - initialLimit);
-  const offset = randomIntInclusive(0, maxOffset);
-
-  const payload = await fetchJsonWithRetries(
-    buildQueryApiUrl({
+    const url = buildQueryApiUrl({
       fields: API_FIELDS,
-      limit: initialLimit,
-      offset
-    }),
-    {
+      limit: query.pageSize,
+      offset,
+      sort,
+      clauses,
+      clauseMode: "AND"
+    });
+
+    const payload = await fetchJsonWithRetries(url, {
       timeoutMs: FETCH_TIMEOUT_MS,
       maxRetries: MAX_FETCH_RETRIES
-    }
-  );
+    });
 
-  const asteroids = mapQueryPayloadToAsteroids(payload);
-  return {
-    meta: {
-      source: "NASA/JPL SBDB Query API",
-      fetchedAt: new Date().toISOString(),
-      loadedCount: asteroids.length,
-      availableCount,
-      sampleMode: "live-random-window",
-      warning: null,
-      coreObjectIds: []
-    },
-    asteroids
-  };
-}
+    const asteroids = mapQueryPayloadToAsteroids(payload);
+    const totalCount = toFiniteNumber(payload?.count) ?? asteroids.length;
 
-async function fetchAsteroidsByIdentifiers(values, fieldName) {
-  const clauses = values
-    .map((value) => sanitizeConstraintValue(value))
-    .filter(Boolean)
-    .map((value) => `${fieldName}|EQ|${value}`);
-
-  if (!clauses.length) {
-    return [];
+    return {
+      meta: {
+        source: "NASA/JPL SBDB Query API",
+        fetchedAt: new Date().toISOString(),
+        page: query.page,
+        pageSize: query.pageSize,
+        totalCount,
+        sortKey: query.sortKey,
+        sortDirection: query.sortDirection,
+        zone: query.zone,
+        diameterFilter: query.diameterFilter,
+        minDiameterKm: query.minDiameterKm
+      },
+      asteroids
+    };
   }
 
-  return fetchAsteroidsByClauses(clauses, {
-    limit: clauses.length,
-    clauseMode: "OR"
-  });
-}
+  async function searchAsteroids(rawQuery, limit) {
+    await ensureStartupSampleReady();
+    const localMatches = searchPreparedSample(rawQuery, limit);
+    let lookupUnavailable = false;
+    const exactMatch = await resolveExactMatch(rawQuery).catch(() => { lookupUnavailable = true; return null; });
+    const exactMatches = exactMatch ? [exactMatch] : [];
+    const asteroids = dedupeAsteroids([...exactMatches, ...localMatches]).slice(0, limit);
 
-async function fetchAsteroidsByClauses(clauses, options = {}) {
-  const url = buildQueryApiUrl({
-    fields: API_FIELDS,
-    limit: options.limit ?? clauses.length,
-    sort: options.sort,
-    clauses,
-    clauseMode: options.clauseMode ?? "OR"
-  });
-
-  const payload = await fetchJsonWithRetries(url, {
-    timeoutMs: FETCH_TIMEOUT_MS,
-    maxRetries: MAX_FETCH_RETRIES
-  });
-
-  return mapQueryPayloadToAsteroids(payload);
-}
-
-function buildCatalogClauses(query) {
-  const clauses = [];
-
-  if (query.zone === "Inner Belt") {
-    clauses.push("a|LT|2.5");
-  } else if (query.zone === "Middle Belt") {
-    clauses.push("a|GE|2.5", "a|LT|2.82");
-  } else if (query.zone === "Outer Belt") {
-    clauses.push("a|GE|2.82");
+    return {
+      meta: {
+        source: exactMatches.length > 0
+          ? "Prepared startup sample + NASA/JPL exact lookup"
+          : "Prepared startup sample search",
+        fetchedAt: new Date().toISOString(),
+        query: rawQuery,
+        loadedCount: asteroids.length,
+        availableCount: null,
+        warning: lookupUnavailable ? "Live JPL lookup is temporarily unavailable. These results come from the prepared startup sample." : null
+      },
+      asteroids
+    };
   }
 
-  if (query.diameterFilter === "known") {
-    clauses.push("diameter|DF");
-  } else if (query.diameterFilter === "unknown") {
-    clauses.push("diameter|ND");
+  async function resolveExactMatch(query) {
+    const url = `${OBJECT_API_BASE_URL}?${new URLSearchParams({ sstr: query }).toString()}`;
+    const payload = await fetchJsonWithRetries(url, {
+      timeoutMs: FETCH_TIMEOUT_MS,
+      maxRetries: MAX_FETCH_RETRIES
+    });
+
+    return mapObjectPayloadToAsteroid(payload);
   }
 
-  if (Number.isFinite(query.minDiameterKm)) {
-    clauses.push(`diameter|GE|${query.minDiameterKm}`);
-  }
+  async function fetchRandomWindowSample(targetSize) {
+    const initialLimit = Math.max(1, Math.min(targetSize, DEFAULT_STARTUP_SAMPLE_SIZE));
+    const initialUrl = buildQueryApiUrl({
+      fields: API_FIELDS,
+      limit: 1
+    });
+    const initialPayload = await fetchJsonWithRetries(initialUrl, {
+      timeoutMs: FETCH_TIMEOUT_MS,
+      maxRetries: MAX_FETCH_RETRIES
+    });
+    const availableCount = Math.max(initialLimit, toFiniteNumber(initialPayload?.count) ?? initialLimit);
+    const maxOffset = Math.max(0, availableCount - initialLimit);
+    const offset = randomIntInclusive(0, maxOffset);
 
-  return clauses;
-}
-
-function buildCatalogSort(sortKey, sortDirection) {
-  const sortFieldByKey = {
-    name: "full_name",
-    zone: "a",
-    a: "a",
-    e: "e",
-    i: "i",
-    diameterKm: "diameter"
-  };
-
-  const sortField = sortFieldByKey[sortKey] ?? "full_name";
-  return `${sortDirection === "desc" ? "-" : ""}${sortField}`;
-}
-
-function searchPreparedSample(rawQuery, limit) {
-  const query = rawQuery.trim().toLowerCase();
-  if (!query) {
-    return [];
-  }
-
-  const scored = [];
-  for (const asteroid of sampleState.asteroids) {
-    const name = asteroid.name?.toLowerCase() ?? "";
-    const designation = asteroid.primaryDesignation?.toLowerCase() ?? "";
-    const id = asteroid.id?.toLowerCase() ?? "";
-    const haystack = `${name} ${designation} ${id}`;
-    if (!haystack.includes(query)) {
-      continue;
-    }
-
-    let score = 1;
-    if (name === query || designation === query || id === query) {
-      score = 4;
-    } else if (name.startsWith(query) || designation.startsWith(query) || id.startsWith(query)) {
-      score = 3;
-    } else if (name.includes(query) || designation.includes(query)) {
-      score = 2;
-    }
-
-    scored.push({ asteroid, score });
-  }
-
-  return scored
-    .sort((left, right) => {
-      if (right.score !== left.score) {
-        return right.score - left.score;
+    const payload = await fetchJsonWithRetries(
+      buildQueryApiUrl({
+        fields: API_FIELDS,
+        limit: initialLimit,
+        offset
+      }),
+      {
+        timeoutMs: FETCH_TIMEOUT_MS,
+        maxRetries: MAX_FETCH_RETRIES
       }
-      return String(left.asteroid.name).localeCompare(String(right.asteroid.name));
-    })
-    .slice(0, limit)
-    .map((entry) => entry.asteroid);
-}
+    );
 
-function mapObjectPayloadToAsteroid(payload) {
-  const object = payload?.object;
-  if (!object?.spkid || !object?.fullname) {
-    return null;
+    const asteroids = mapQueryPayloadToAsteroids(payload);
+    return {
+      meta: {
+        source: "NASA/JPL SBDB Query API",
+        fetchedAt: new Date().toISOString(),
+        loadedCount: asteroids.length,
+        availableCount,
+        sampleMode: "live-random-window",
+        warning: null,
+        coreObjectIds: []
+      },
+      asteroids
+    };
   }
 
-  const orbitElements = new Map(
-    Array.isArray(payload?.orbit?.elements)
-      ? payload.orbit.elements.map((entry) => [entry?.name, entry?.value])
-      : []
-  );
-  const physicalParameters = new Map(
-    Array.isArray(payload?.phys_par)
-      ? payload.phys_par.map((entry) => [entry?.name, entry?.value])
-      : []
-  );
+  async function fetchAsteroidsByIdentifiers(values, fieldName) {
+    const clauses = values
+      .map((value) => sanitizeConstraintValue(value))
+      .filter(Boolean)
+      .map((value) => `${fieldName}|EQ|${value}`);
 
-  const a = toFiniteNumber(orbitElements.get("a"));
-  const e = toFiniteNumber(orbitElements.get("e"));
-  const i = toFiniteNumber(orbitElements.get("i"));
-  if (!Number.isFinite(a) || !Number.isFinite(e) || !Number.isFinite(i)) {
-    return null;
+    if (!clauses.length) {
+      return [];
+    }
+
+    return fetchAsteroidsByClauses(clauses, {
+      limit: clauses.length,
+      clauseMode: "OR"
+    });
   }
 
-  const orbitalPeriodDays = toFiniteNumber(orbitElements.get("per"));
-  return {
-    id: String(object.spkid),
-    name: String(object.fullname).trim(),
-    primaryDesignation: sanitizeConstraintValue(object.pdes ?? object.des),
-    classCode: String(object.orbit_class?.code ?? "Unknown"),
-    zone: classifyBeltZone(a),
-    a,
-    e,
-    i,
-    om: toFiniteNumber(orbitElements.get("om")),
-    w: toFiniteNumber(orbitElements.get("w")),
-    ma: toFiniteNumber(orbitElements.get("ma")),
-    diameterKm: toFiniteNumber(physicalParameters.get("diameter")),
-    albedo: toFiniteNumber(physicalParameters.get("albedo")),
-    absoluteMagnitudeH: toFiniteNumber(physicalParameters.get("H")),
-    epochMjd: null,
-    orbitalPeriodYears: Number.isFinite(orbitalPeriodDays)
-      ? orbitalPeriodDays / 365.25
-      : periodYearsFromSemiMajorAxis(a)
-  };
-}
+  async function fetchAsteroidsByClauses(clauses, options = {}) {
+    const url = buildQueryApiUrl({
+      fields: API_FIELDS,
+      limit: options.limit ?? clauses.length,
+      sort: options.sort,
+      clauses,
+      clauseMode: options.clauseMode ?? "OR"
+    });
 
-function normalizeCatalogQuery(searchParams) {
-  return {
-    page: clampInt(searchParams.get("page"), 1, 100_000, 1),
-    pageSize: clampInt(searchParams.get("pageSize"), 1, TABLE_PAGE_SIZE_MAX, TABLE_PAGE_SIZE_DEFAULT),
-    zone: normalizeZone(searchParams.get("zone")),
-    diameterFilter: normalizeDiameterFilter(searchParams.get("diameterFilter")),
-    minDiameterKm: parseNullableNonNegativeNumber(searchParams.get("minDiameterKm")),
-    sortKey: normalizeSortKey(searchParams.get("sortKey")),
-    sortDirection: normalizeSortDirection(searchParams.get("sortDirection"))
-  };
-}
+    const payload = await fetchJsonWithRetries(url, {
+      timeoutMs: FETCH_TIMEOUT_MS,
+      maxRetries: MAX_FETCH_RETRIES
+    });
 
-function normalizeZone(rawValue) {
-  if (rawValue === "Inner Belt" || rawValue === "Middle Belt" || rawValue === "Outer Belt") {
-    return rawValue;
-  }
-  return "all";
-}
-
-function normalizeDiameterFilter(rawValue) {
-  if (rawValue === "known" || rawValue === "unknown") {
-    return rawValue;
-  }
-  return "all";
-}
-
-function normalizeSortKey(rawValue) {
-  const allowed = new Set(["name", "zone", "a", "e", "i", "diameterKm"]);
-  return allowed.has(rawValue) ? rawValue : "name";
-}
-
-function normalizeSortDirection(rawValue) {
-  return rawValue === "desc" ? "desc" : "asc";
-}
-
-function parseNullableNonNegativeNumber(rawValue) {
-  const parsed = Number(rawValue);
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return null;
-  }
-  return parsed;
-}
-
-async function ensureStartupSampleReady() {
-  if (sampleState.asteroids.length > 0) {
-    return;
+    return mapQueryPayloadToAsteroids(payload);
   }
 
-  await initializeStartupSample();
-}
+  function buildCatalogClauses(query) {
+    const clauses = [];
 
-function getCachedPayload(cacheKey) {
-  const entry = responseCache.get(cacheKey);
-  if (!entry) {
-    return null;
+    if (query.zone === "Inner Belt") {
+      clauses.push("a|LT|2.5");
+    } else if (query.zone === "Middle Belt") {
+      clauses.push("a|GE|2.5", "a|LT|2.82");
+    } else if (query.zone === "Outer Belt") {
+      clauses.push("a|GE|2.82");
+    }
+
+    if (query.diameterFilter === "known") {
+      clauses.push("diameter|DF");
+    } else if (query.diameterFilter === "unknown") {
+      clauses.push("diameter|ND");
+    }
+
+    if (Number.isFinite(query.minDiameterKm)) {
+      clauses.push(`diameter|GE|${query.minDiameterKm}`);
+    }
+
+    return clauses;
   }
-  if (entry.expiresAt <= Date.now()) {
-    responseCache.delete(cacheKey);
-    return null;
+
+  function buildCatalogSort(sortKey, sortDirection) {
+    const sortFieldByKey = {
+      name: "full_name",
+      zone: "a",
+      a: "a",
+      e: "e",
+      i: "i",
+      diameterKm: "diameter"
+    };
+
+    const sortField = sortFieldByKey[sortKey] ?? "full_name";
+    return `${sortDirection === "desc" ? "-" : ""}${sortField}`;
   }
-  return entry.payload;
-}
 
-function setCachedPayload(cacheKey, payload) {
-  responseCache.set(cacheKey, {
-    payload,
-    expiresAt: Date.now() + QUERY_CACHE_TTL_MS
-  });
-}
+  function searchPreparedSample(rawQuery, limit) {
+    const query = rawQuery.trim().toLowerCase();
+    if (!query) {
+      return [];
+    }
 
-async function readPreparedStartupSample() {
-  try {
-    const file = await fsPromises.readFile(STARTUP_SAMPLE_PATH, "utf8");
-    const payload = JSON.parse(file);
-    if (!Array.isArray(payload?.asteroids) || payload.asteroids.length === 0) {
+    const scored = [];
+    for (const asteroid of sampleState.asteroids) {
+      const name = asteroid.name?.toLowerCase() ?? "";
+      const designation = asteroid.primaryDesignation?.toLowerCase() ?? "";
+      const id = asteroid.id?.toLowerCase() ?? "";
+      const haystack = `${name} ${designation} ${id}`;
+      if (!haystack.includes(query)) {
+        continue;
+      }
+
+      let score = 1;
+      if (name === query || designation === query || id === query) {
+        score = 4;
+      } else if (name.startsWith(query) || designation.startsWith(query) || id.startsWith(query)) {
+        score = 3;
+      } else if (name.includes(query) || designation.includes(query)) {
+        score = 2;
+      }
+
+      scored.push({ asteroid, score });
+    }
+
+    return scored
+      .sort((left, right) => {
+        if (right.score !== left.score) {
+          return right.score - left.score;
+        }
+        return String(left.asteroid.name).localeCompare(String(right.asteroid.name));
+      })
+      .slice(0, limit)
+      .map((entry) => entry.asteroid);
+  }
+
+  function mapObjectPayloadToAsteroid(payload) {
+    const object = payload?.object;
+    if (!object?.spkid || !object?.fullname) {
       return null;
     }
-    return payload;
-  } catch {
-    return null;
+
+    const orbitElements = new Map(
+      Array.isArray(payload?.orbit?.elements)
+        ? payload.orbit.elements.map((entry) => [entry?.name, entry?.value])
+        : []
+    );
+    const physicalParameters = new Map(
+      Array.isArray(payload?.phys_par)
+        ? payload.phys_par.map((entry) => [entry?.name, entry?.value])
+        : []
+    );
+
+    const a = toFiniteNumber(orbitElements.get("a"));
+    const e = toFiniteNumber(orbitElements.get("e"));
+    const i = toFiniteNumber(orbitElements.get("i"));
+    if (!Number.isFinite(a) || !Number.isFinite(e) || !Number.isFinite(i)) {
+      return null;
+    }
+
+    const orbitalPeriodDays = toFiniteNumber(orbitElements.get("per"));
+    return {
+      id: String(object.spkid),
+      name: String(object.fullname).trim(),
+      primaryDesignation: sanitizeConstraintValue(object.pdes ?? object.des),
+      classCode: String(object.orbit_class?.code ?? "Unknown"),
+      zone: classifyBeltZone(a),
+      a,
+      e,
+      i,
+      om: toFiniteNumber(orbitElements.get("om")),
+      w: toFiniteNumber(orbitElements.get("w")),
+      ma: toFiniteNumber(orbitElements.get("ma")),
+      diameterKm: toFiniteNumber(physicalParameters.get("diameter")),
+      albedo: toFiniteNumber(physicalParameters.get("albedo")),
+      absoluteMagnitudeH: toFiniteNumber(physicalParameters.get("H")),
+      epochMjd: null,
+      orbitalPeriodYears: Number.isFinite(orbitalPeriodDays)
+        ? orbitalPeriodDays / 365.25
+        : periodYearsFromSemiMajorAxis(a)
+    };
+  }
+
+  function normalizeCatalogQuery(searchParams) {
+    return {
+      page: clampInt(searchParams.get("page"), 1, 100_000, 1),
+      pageSize: clampInt(searchParams.get("pageSize"), 1, TABLE_PAGE_SIZE_MAX, TABLE_PAGE_SIZE_DEFAULT),
+      zone: normalizeZone(searchParams.get("zone")),
+      diameterFilter: normalizeDiameterFilter(searchParams.get("diameterFilter")),
+      minDiameterKm: parseNullableNonNegativeNumber(searchParams.get("minDiameterKm")),
+      sortKey: normalizeSortKey(searchParams.get("sortKey")),
+      sortDirection: normalizeSortDirection(searchParams.get("sortDirection"))
+    };
+  }
+
+  function normalizeZone(rawValue) {
+    if (rawValue === "Inner Belt" || rawValue === "Middle Belt" || rawValue === "Outer Belt") {
+      return rawValue;
+    }
+    return "all";
+  }
+
+  function normalizeDiameterFilter(rawValue) {
+    if (rawValue === "known" || rawValue === "unknown") {
+      return rawValue;
+    }
+    return "all";
+  }
+
+  function normalizeSortKey(rawValue) {
+    const allowed = new Set(["name", "zone", "a", "e", "i", "diameterKm"]);
+    return allowed.has(rawValue) ? rawValue : "name";
+  }
+
+  function normalizeSortDirection(rawValue) {
+    return rawValue === "desc" ? "desc" : "asc";
+  }
+
+  function parseNullableNonNegativeNumber(rawValue) {
+    if (rawValue === null || String(rawValue).trim() === "") return null;
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      return null;
+    }
+    return parsed;
+  }
+
+  async function ensureStartupSampleReady() {
+    if (sampleState.asteroids.length > 0) {
+      return;
+    }
+
+    await initializeStartupSample();
+  }
+
+  function getCachedPayload(cacheKey) {
+    return responseCache.get(cacheKey);
+  }
+
+  async function loadSharedPayload(key, loader) {
+    if (payloadInFlight.has(key)) return payloadInFlight.get(key);
+    if (payloadInFlight.size >= 16) throw new UpstreamError("Too many distinct requests in progress.", { statusCode: 503 });
+    const promise = Promise.resolve().then(loader).then((payload) => {
+      responseCache.set(key, payload, payload.meta?.warning ? 30_000 : 600_000); return payload;
+    }).finally(() => payloadInFlight.delete(key));
+    payloadInFlight.set(key, promise);
+    return promise;
+  }
+
+  async function readPreparedStartupSample() {
+    try {
+      const file = await fsPromises.readFile(startupSamplePath, "utf8");
+      const payload = JSON.parse(file);
+      if (!Array.isArray(payload?.asteroids) || payload.asteroids.length === 0) {
+        return null;
+      }
+      return payload;
+    } catch {
+      return null;
+    }
+  }
+
+  async function serveStatic(urlPathname, method, res) {
+    const normalized = sanitizePathname(urlPathname);
+    const candidate = normalized === "/" ? "/index.html" : normalized;
+    if (!PUBLIC_FILES.has(candidate)) {
+      sendJson(res, 404, { error: "Not found" }); return;
+    }
+    const relativeCandidate = candidate.replace(/^\/+/, "");
+    const filePath = path.join(ROOT_DIR, relativeCandidate);
+
+    if (!filePath.startsWith(ROOT_DIR)) {
+      sendJson(res, 403, { error: "Forbidden" });
+      return;
+    }
+
+    let content;
+    try {
+      content = await fsPromises.readFile(filePath);
+    } catch {
+      sendJson(res, 404, { error: "Not found" });
+      return;
+    }
+
+    const ext = path.extname(filePath).toLowerCase();
+    const contentType = mimeByExt[ext] || "application/octet-stream";
+    res.writeHead(200, buildSecurityHeaders({ "Content-Type": contentType, "Content-Length": String(content.length),
+      "Cache-Control": ext === ".html" ? "no-cache" : "public, max-age=300" }));
+
+    if (method === "HEAD") {
+      res.end();
+      return;
+    }
+    res.end(content);
+  }
+
+  function sanitizePathname(pathname) {
+    const decoded = decodeURIComponent(pathname || "/");
+    const normalized = path.posix.normalize(decoded);
+    if (!normalized.startsWith("/")) {
+      return `/${normalized}`;
+    }
+    return normalized;
+  }
+
+  function sendJson(res, statusCode, payload, extraHeaders = {}) {
+    const body = JSON.stringify(payload);
+    res.writeHead(
+      statusCode,
+      buildSecurityHeaders({
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Length": Buffer.byteLength(body).toString(),
+        ...extraHeaders
+      })
+    );
+    res.end(body);
+  }
+
+  function buildSecurityHeaders(additionalHeaders) {
+    return {
+      "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "strict-origin-when-cross-origin",
+      "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+      ...additionalHeaders
+    };
+  }
+
+  function randomIntInclusive(min, max) {
+    if (max <= min) {
+      return min;
+    }
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  }
+
+  function chunkArray(items, chunkSize) {
+    const output = [];
+    for (let index = 0; index < items.length; index += chunkSize) {
+      output.push(items.slice(index, index + chunkSize));
+    }
+    return output;
+  }
+
+  function clampInt(rawValue, min, max, fallback) {
+    if (rawValue === null || String(rawValue).trim() === "") return fallback;
+    const parsed = Number(rawValue);
+    if (!Number.isFinite(parsed)) {
+      return fallback;
+    }
+    return Math.min(max, Math.max(min, Math.floor(parsed)));
+  }
+
+  function toFiniteNumber(value) {
+    if (value === null || value === undefined || value === "") return null;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function periodYearsFromSemiMajorAxis(a) {
+    if (!Number.isFinite(a) || a <= 0) {
+      return null;
+    }
+    return Math.sqrt(a ** 3);
+  }
+
+  function classifyBeltZone(a) {
+    if (!Number.isFinite(a)) {
+      return "Unknown";
+    }
+    if (a < 2.5) {
+      return "Inner Belt";
+    }
+    if (a < 2.82) {
+      return "Middle Belt";
+    }
+    return "Outer Belt";
   }
 }
 
-async function serveStatic(urlPathname, method, res) {
-  const normalized = sanitizePathname(urlPathname);
-  const candidate = normalized === "/" ? "/index.html" : normalized;
-  const relativeCandidate = candidate.replace(/^\/+/, "");
-  const filePath = path.join(ROOT_DIR, relativeCandidate);
+function normalizeIp(value) { return value.startsWith("::ffff:") ? value.slice(7) : value; }
 
-  if (!filePath.startsWith(ROOT_DIR)) {
-    sendJson(res, 403, { error: "Forbidden" });
-    return;
-  }
-
-  let content;
-  try {
-    content = await fsPromises.readFile(filePath);
-  } catch {
-    sendJson(res, 404, { error: "Not found" });
-    return;
-  }
-
-  const ext = path.extname(filePath).toLowerCase();
-  const contentType = mimeByExt[ext] || "application/octet-stream";
-  res.writeHead(200, buildSecurityHeaders({ "Content-Type": contentType }));
-
-  if (method === "HEAD") {
-    res.end();
-    return;
-  }
-  res.end(content);
-}
-
-function sanitizePathname(pathname) {
-  const decoded = decodeURIComponent(pathname || "/");
-  const normalized = path.posix.normalize(decoded);
-  if (!normalized.startsWith("/")) {
-    return `/${normalized}`;
-  }
-  return normalized;
-}
-
-function sendJson(res, statusCode, payload, extraHeaders = {}) {
-  const body = JSON.stringify(payload);
-  res.writeHead(
-    statusCode,
-    buildSecurityHeaders({
-      "Content-Type": "application/json; charset=utf-8",
-      "Content-Length": Buffer.byteLength(body).toString(),
-      ...extraHeaders
-    })
-  );
-  res.end(body);
-}
-
-function buildSecurityHeaders(additionalHeaders) {
-  return {
-    "X-Content-Type-Options": "nosniff",
-    "Referrer-Policy": "strict-origin-when-cross-origin",
-    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
-    ...additionalHeaders
-  };
-}
-
-function randomIntInclusive(min, max) {
-  if (max <= min) {
-    return min;
-  }
-  return Math.floor(Math.random() * (max - min + 1)) + min;
-}
-
-function chunkArray(items, chunkSize) {
-  const output = [];
-  for (let index = 0; index < items.length; index += chunkSize) {
-    output.push(items.slice(index, index + chunkSize));
-  }
-  return output;
-}
-
-function clampInt(rawValue, min, max, fallback) {
-  const parsed = Number(rawValue);
-  if (!Number.isFinite(parsed)) {
-    return fallback;
-  }
-  return Math.min(max, Math.max(min, Math.floor(parsed)));
-}
-
-function toFiniteNumber(value) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-function periodYearsFromSemiMajorAxis(a) {
-  if (!Number.isFinite(a) || a <= 0) {
-    return null;
-  }
-  return Math.sqrt(a ** 3);
-}
-
-function classifyBeltZone(a) {
-  if (!Number.isFinite(a)) {
-    return "Unknown";
-  }
-  if (a < 2.5) {
-    return "Inner Belt";
-  }
-  if (a < 2.82) {
-    return "Middle Belt";
-  }
-  return "Outer Belt";
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) {
+  const application = createApplication();
+  application.server.listen(PORT, HOST, () => {
+    console.log(`Asteroid Explorer server listening on port ${PORT}`);
+  });
+  for (const signal of ["SIGTERM", "SIGINT"]) process.once(signal, () => {
+    application.server.close(() => process.exit(0));
+    setTimeout(() => process.exit(1), 10_000).unref();
+  });
 }

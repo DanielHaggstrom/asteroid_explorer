@@ -3,10 +3,11 @@
 Browser-based dashboard for visual and intuitive exploration of main-belt asteroids using official NASA/JPL public API data.
 
 ## Live App
-- Production deployment: https://asteroid-explorer.onrender.com/
-- Health check: https://asteroid-explorer.onrender.com/healthz
+- Public VPS deployment: https://asteroids.classroom-fox.com/
+- Legacy Render fallback: https://asteroid-explorer.onrender.com/
+- Health check: `/healthz` on the deployment being used.
 
-Free Render instances can cold-start after inactivity, so the first request may take a short moment.
+The app also supports a hardened VPS deployment with explicit publishing and recovery on failed readiness. See [deployment instructions](docs/DEPLOYMENT.md). Render free instances can cold-start after inactivity.
 
 ## What The App Does
 1. Shows a prepared sample of main-belt asteroids immediately at startup for fast first paint.
@@ -31,7 +32,7 @@ More detail:
 - [Roadmap](docs/ROADMAP.md)
 
 ## Data Model
-This project intentionally uses a hybrid model that fits Render's free-tier constraints.
+This project uses a prepared dataset for fast startup and bounded live requests for exploration beyond that sample.
 
 1. `data/main-belt-startup.json`
 - Prepared startup sample committed into the repo.
@@ -49,11 +50,11 @@ Reference APIs:
 
 ## Local Run
 Requirements:
-1. Node.js 18+
+1. Node.js 24 LTS recommended (Node 22 is also tested).
 
 Commands:
 ```bash
-npm install
+npm ci --ignore-scripts
 npm test
 npm run dev
 ```
@@ -82,30 +83,35 @@ What this command does:
 5. Optionally auto-commits only the sample artifacts.
 
 ## Deployment
-This repo is Render-first, but not Render-only.
+The browser assets and API share one Node process. Static-only hosting does not provide full live catalog/search functionality.
 
-1. Reference deployment target: Render Node web service.
-2. Works on any Node host that can make outbound HTTPS requests to the JPL APIs.
-3. Static-only hosting is not enough because the app depends on same-origin API endpoints served by `server.mjs`.
+After committing a clean checkout, publish explicitly through your existing SSH connection:
 
-Current production deployment:
-- https://asteroid-explorer.onrender.com/
+```sh
+python deploy/publish.py --host YOUR_SSH_ALIAS
+```
 
-Recommended Render settings:
-1. Runtime: `Node`
-2. Build command: `npm install`
-3. Start command: `npm run serve`
+On Windows, the wrapper finds an available Python 3 runtime:
+
+```powershell
+.\deploy.ps1 -HostAlias YOUR_SSH_ALIAS
+```
+
+This tests the commit, sends allowlisted source only, verifies the transfer and invokes a separately installed trusted server controller. Failed readiness restores the previous version. No Git key or automatic deployment poller is installed on the VPS. See [bootstrap, DNS, limits and recovery details](docs/DEPLOYMENT.md).
 
 ## No-Secrets Policy
 1. No API key is required.
 2. No secrets are embedded in the client or server.
-3. `.env*` remains ignored for future extensions, but this project does not currently need any environment secrets.
+3. `.env*` remains ignored. Server configuration and real contact details stay in `/etc/asteroid-explorer/environment`, outside Git and the image.
+4. Deployment archives contain allowlisted application files only; operational scripts and private files are excluded.
 
 ## Testing
-Current tests cover the core math and categorization helpers used by the frontend:
-1. Diameter bucketing.
-2. Belt-zone classification.
-3. Kepler solver and orbital-position sanity.
+Application tests cover frontend math, backend request boundaries, bounded caching/upstream work and readiness. Deployment tests exercise archive validation, source selection and rollback without contacting Docker, SSH or JPL:
+
+```sh
+npm test
+python -m unittest discover -s deploy -p 'test_*.py' -v
+```
 
 ## Author
 Daniel Häggström Pérez-Flecha

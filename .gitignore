@@ -25,3 +25,11 @@ __pycache__/
 .env
 .env.*
 !.env.example
+
+# Private deployment overrides, archives and SSH material
+deploy/environment
+deploy/*.local.*
+*.tar
+*.tar.gz
+*.pem
+*.key

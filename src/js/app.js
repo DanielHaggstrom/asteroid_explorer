@@ -1,5 +1,6 @@
 ﻿import { APP_CONFIG } from "./config.js";
 import { loadCatalogPage, loadMainBeltAsteroids, searchAsteroids } from "./dataService.js";
+import { ResultCache, describeSearchResult } from "./resultCache.js";
 import {
   drawBarChart,
   drawBeltMap,
@@ -92,7 +93,8 @@ const state = {
     minDiameterKm: null,
     isLoading: false,
     error: null,
-    pageCache: new Map(),
+    warning: null,
+    pageCache: new ResultCache(),
     inFlightCacheKeys: new Set()
   }
 };
@@ -345,12 +347,12 @@ function buildTableSummaryText(rowCount) {
     return `Catalog page unavailable: ${state.table.error}`;
   }
   if (state.table.totalCount === 0) {
-    return "No catalog rows match the current filters.";
+    return `${state.table.warning ? `${state.table.warning} ` : ""}No catalog rows match the current filters.`;
   }
 
   const pageStartIndex = (state.table.page - 1) * state.table.pageSize;
   const pageEndIndex = pageStartIndex + rowCount;
-  return `Rows ${formatNumber(pageStartIndex + 1, 0)}-${formatNumber(pageEndIndex, 0)} of ${formatNumber(state.table.totalCount, 0)} matching the current filters.`;
+  return `${state.table.warning ? `${state.table.warning} ` : ""}Rows ${formatNumber(pageStartIndex + 1, 0)}-${formatNumber(pageEndIndex, 0)} of ${formatNumber(state.table.totalCount, 0)} matching the current filters.`;
 }
 
 function createRow(asteroid) {
@@ -384,7 +386,7 @@ async function refreshTable() {
   if (cached) {
     applyTableResult(cached);
     renderTable();
-    void prefetchAdjacentTablePages(tableQuery, cached.meta.totalCount);
+    if (!cached.meta.warning) void prefetchAdjacentTablePages(tableQuery, cached.meta.totalCount);
     return;
   }
 
@@ -404,7 +406,7 @@ async function refreshTable() {
 
     cacheTablePage(tableQuery, result);
     applyTableResult(result);
-    void prefetchAdjacentTablePages(tableQuery, result.meta.totalCount);
+    if (!result.meta.warning) void prefetchAdjacentTablePages(tableQuery, result.meta.totalCount);
   } catch (error) {
     if (requestToken !== state.tableRequestToken) {
       return;
@@ -607,17 +609,14 @@ async function fetchRemoteSearch(query, requestToken) {
     }
 
     const matches = result.asteroids;
+    const description = describeSearchResult(result, query);
     if (matches.length === 0) {
-      setStatus(`No matching asteroid found for "${query}".`, "warning");
+      setStatus(description.message, description.type);
       return;
     }
 
     setSelectedAsteroid(matches[0]);
-    if (matches.length === 1) {
-      setStatus(`Selected ${matches[0].name} from the live JPL search.`);
-    } else {
-      setStatus(`Selected ${matches[0].name}; ${formatNumber(matches.length, 0)} matches returned by the live JPL search.`);
-    }
+    setStatus(description.message, description.type);
   } catch (error) {
     if (requestToken !== state.searchRequestToken) {
       return;
@@ -713,20 +712,14 @@ function getCachedTablePage(query) {
 }
 
 function cacheTablePage(query, result) {
-  const cacheKey = getTableCacheKey(query);
-  state.table.pageCache.delete(cacheKey);
-  state.table.pageCache.set(cacheKey, result);
-
-  while (state.table.pageCache.size > 18) {
-    const oldestKey = state.table.pageCache.keys().next().value;
-    state.table.pageCache.delete(oldestKey);
-  }
+  state.table.pageCache.set(getTableCacheKey(query), result);
 }
 
 function applyTableResult(result) {
   state.table.rows = result.asteroids;
   state.table.totalCount = result.meta.totalCount;
   state.table.error = null;
+  state.table.warning = result.meta.warning || null;
   state.table.isLoading = false;
 }
 

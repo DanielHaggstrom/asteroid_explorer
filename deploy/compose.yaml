@@ -1,0 +1,32 @@
+# Reviewed root-owned configuration, installed at /etc/asteroid-explorer/compose.yaml.
+# Published source cannot replace this file or the installed controller/Dockerfile.
+services:
+  app:
+    image: ${ASTEROID_EXPLORER_IMAGE:?Set a tested committed release image}
+    restart: unless-stopped
+    init: true
+    user: "10002:10002"
+    ports:
+      - "127.0.0.1:4173:4173"
+    environment:
+      NODE_ENV: production
+      PORT: "4173"
+      JPL_USER_AGENT: ${JPL_USER_AGENT:?Set an identifying upstream User-Agent in private server configuration}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-}
+      JPL_API_ENABLED: ${JPL_API_ENABLED:-true}
+      JPL_REFRESH_ENABLED: ${JPL_REFRESH_ENABLED:-true}
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 0.75
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"

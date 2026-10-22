@@ -1,0 +1,13 @@
+**
+!package.json
+!package-lock.json
+!server.mjs
+!index.html
+!lib/
+!lib/**
+!src/
+!src/**
+!data/
+!data/main-belt-startup.json
+!config/
+!config/startup-sample-core-bodies.json

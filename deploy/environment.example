@@ -1,0 +1,8 @@
+# Copy to /etc/asteroid-explorer/environment on the VPS; keep real contact details there only.
+# This identifies your deployment to the upstream API; no API token is needed.
+JPL_USER_AGENT='AsteroidExplorer/1.0 (+https://your-public-project.example; contact=operator@example.invalid)'
+# Exact Docker bridge gateway as observed by this container, not a whole network/range.
+# Caddy must overwrite X-Real-IP with its actual client IP before enabling this trust.
+TRUSTED_PROXY_IPS=
+JPL_API_ENABLED=true
+JPL_REFRESH_ENABLED=true
