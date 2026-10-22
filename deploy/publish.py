@@ -18,6 +18,13 @@ from server import REQUIRED, allowed_source, commit_id
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTROLLER = "/usr/local/sbin/asteroid-explorer-deploy"
+SSH_OPTIONS = (
+    "-o", "BatchMode=yes",
+    "-o", "ConnectTimeout=15",
+    "-o", "ConnectionAttempts=1",
+    "-o", "ServerAliveInterval=10",
+    "-o", "ServerAliveCountMax=3",
+)
 
 
 def check_host(host: str) -> str:
@@ -80,13 +87,13 @@ def main() -> int:
             bundle = Path(directory) / "release.tar"
             run("git", "archive", "--format=tar", "--output", str(bundle), commit, "--", *paths)
             checksum = hashlib.sha256(bundle.read_bytes()).hexdigest()
-            remote_path = check_upload_path(run("ssh", "-o", "BatchMode=yes", host,
+            remote_path = check_upload_path(run("ssh", *SSH_OPTIONS, host,
                 "mktemp /srv/asteroid-explorer/incoming/upload-XXXXXXXXXX.tar", capture=True))
-            run("scp", "-o", "BatchMode=yes", str(bundle), f"{host}:{remote_path}")
+            run("scp", *SSH_OPTIONS, str(bundle), f"{host}:{remote_path}")
             command = [CONTROLLER, remote_path, commit, checksum]
             if not args.as_root:
                 command = ["sudo", "-n", *command]
-            run("ssh", "-o", "BatchMode=yes", host, shlex.join(command))
+            run("ssh", *SSH_OPTIONS, host, shlex.join(command))
         print(f"Deployed committed release {commit}.")
         return 0
     except (ValueError, OSError, UnicodeError, subprocess.CalledProcessError) as error:
@@ -95,7 +102,7 @@ def main() -> int:
     finally:
         if remote_path:
             try:
-                result = subprocess.run(["ssh", "-o", "BatchMode=yes", host,
+                result = subprocess.run(["ssh", *SSH_OPTIONS, host,
                                          shlex.join(["rm", "-f", "--", remote_path])])
                 removed = result.returncode == 0
             except OSError:

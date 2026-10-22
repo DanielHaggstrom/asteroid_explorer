@@ -107,6 +107,37 @@ class ArchiveTests(unittest.TestCase):
 
 
 class PublishTests(unittest.TestCase):
+    def test_every_network_command_has_bounded_connect_and_liveness_options(self):
+        expected_options = (
+            "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "ConnectionAttempts=1",
+            "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
+        )
+        self.assertEqual(publish.SSH_OPTIONS, expected_options)
+        remote_path = "/srv/asteroid-explorer/incoming/upload-Ab123.tar"
+        commands = []
+
+        def fake_run(*args, **kwargs):
+            commands.append(args)
+            if args[:2] == ("git", "archive"):
+                Path(args[args.index("--output") + 1]).write_bytes(b"committed source archive")
+            if args[0] == "ssh" and args[-1].startswith("mktemp "):
+                return remote_path
+            return ""
+
+        with patch.object(publish.sys, "argv", ["publish.py", "--host", "my-host"]), \
+                patch.object(publish, "clean_commit", return_value=COMMIT), \
+                patch.object(publish, "source_paths", return_value=sorted(server.REQUIRED)), \
+                patch.object(publish, "run", side_effect=fake_run), \
+                patch.object(publish.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as cleanup:
+            self.assertEqual(publish.main(), 0)
+        network_commands = [command for command in commands if command[0] in {"ssh", "scp"}]
+        self.assertEqual([command[0] for command in network_commands], ["ssh", "scp", "ssh"])
+        for command in network_commands:
+            self.assertEqual(command[1:1 + len(expected_options)], expected_options)
+        cleanup_command = cleanup.call_args.args[0]
+        self.assertEqual(cleanup_command[:1 + len(expected_options)], ["ssh", *expected_options])
+        self.assertEqual(cleanup_command[-2:], ["my-host", f"rm -f -- {remote_path}"])
+
     def test_executable_resolution_handles_windows_npm_cmd(self):
         npm_path = "C:\\Node\\npm.CMD"
         with patch.object(publish.shutil, "which", return_value=npm_path), \
