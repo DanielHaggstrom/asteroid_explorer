@@ -3,11 +3,11 @@
 Browser-based dashboard for visual and intuitive exploration of main-belt asteroids using official NASA/JPL public API data.
 
 ## Live App
-- Public VPS deployment: https://asteroids.classroom-fox.com/
-- Legacy Render fallback: https://asteroid-explorer.onrender.com/
-- Health check: `/healthz` on the deployment being used.
+- Canonical public VPS deployment: https://asteroids.classroom-fox.com/
+- Health check: https://asteroids.classroom-fox.com/healthz
+- Previous Render deployment: suspended on **22 October 2026**, with automatic deployment disabled. It is not an active fallback.
 
-The app also supports a hardened VPS deployment with explicit publishing and recovery on failed readiness. See [deployment instructions](docs/DEPLOYMENT.md). Render free instances can cold-start after inactivity.
+The VPS uses explicit publishing and recovery on failed readiness. The previous Render service was suspended rather than deleted; restoring it requires an intentional manual resume and deployment. See [deployment and recovery instructions](docs/DEPLOYMENT.md).
 
 ## What The App Does
 1. Shows a prepared sample of main-belt asteroids immediately at startup for fast first paint.

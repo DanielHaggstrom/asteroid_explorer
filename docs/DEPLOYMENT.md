@@ -61,7 +61,7 @@ It uploads into `/srv/asteroid-explorer/incoming`; the trusted controller verifi
 
 Compose and local `/healthz` must pass before `/srv/asteroid-explorer/current` changes atomically. Readiness uses the loaded prepared sample, without calling JPL. Failed updates restore the previous release; a failed first installation stops its candidate. The controller retains at least the current/previous releases and three most recent recognized releases/images. Re-publishing the same commit verifies the archive and trusted build-recipe identity, then reuses its image.
 
-Publishing is explicit: there is no server Git key, VPS auto-deploy webhook or polling timer. Uploaded deployment scripts never run as root. Existing Render auto-deploy settings are independent; review them before pushing if that service must remain unchanged.
+Publishing is explicit: there is no server Git key, VPS auto-deploy webhook or polling timer. Uploaded deployment scripts never run as root. The previous Render service is suspended and its automatic deployment is disabled as of 22 October 2026; pushing to GitHub does not publish a VPS release.
 
 Uploads are cleaned up afterward. Following an interrupted publish, remove only its specific `incoming/upload-*.tar` after checking it is unused. A deployment file lock serializes publishes and rollbacks.
 
@@ -107,6 +107,10 @@ The controller verifies image ID/revision, activates and checks readiness before
 
 Back up the trusted controller, `/etc/asteroid-explorer`, Caddy/monitoring configuration, server runbook and active/previous release sources. Git also holds public source and prepared data; runtime caches need no backup. Protect operational backups because future configuration may contain secrets. Existing local VPS backup policy applies; this deployment does not add offsite storage.
 
-## Render compatibility
+## Previous Render deployment
 
-The earlier Render service can remain until DNS, HTTPS and VPS acceptance are complete. It uses `npm ci --ignore-scripts` and `npm run serve` on a supported Node runtime. Prepared files stay read-only and refreshes stay in memory. Repository changes do not disable or delete the existing Render service; retirement is a separate explicit hosting-account action.
+The canonical deployment is `https://asteroids.classroom-fox.com/` on the VPS. On **22 October 2026**, after VPS acceptance, the owner suspended the previous Render service and turned automatic deployment off. Its old public URL, `https://asteroid-explorer.onrender.com/`, returned HTTP 503 with Render's `suspend-by-user` routing status after suspension. It is no longer a live demo or fallback.
+
+The service was **not deleted**. Recovery through Render remains possible by deliberately resuming it in the hosting dashboard and manually deploying a reviewed commit. Before doing so, review its Node runtime, environment and deployment settings; the application remains compatible with `npm ci --ignore-scripts` and `npm run serve` on a supported Node runtime. Keep automatic deployment off unless intentionally changing that policy. For offline verification before a deliberate hosting cutover, disable both live JPL access and background refresh as described above.
+
+Resuming Render does not change the canonical VPS hostname or transfer traffic automatically. Any return to Render is a separate hosting and routing decision; it is not the VPS controller's normal rollback mechanism.
